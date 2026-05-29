@@ -1,0 +1,16 @@
+# Core numerics
+torch>=2.0.0
+numpy>=1.23.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+
+# HuggingFace
+transformers>=4.40.0
+accelerate>=0.27.0
+huggingface-hub>=0.20.0
+
+# Evaluation dataset
+datasets>=2.14.0
+
+# Progress / display
+tqdm>=4.65.0
