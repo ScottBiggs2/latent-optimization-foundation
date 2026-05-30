@@ -58,6 +58,7 @@ def main():
     p.add_argument("--latent_dim",    type=int,   default=32)
     p.add_argument("--hidden_dim",    type=int,   default=256)
     p.add_argument("--cond_dim",      type=int,   default=64)
+    p.add_argument("--val_fraction",  type=float, default=0.0)
     p.add_argument("--epochs",        type=int,   default=500)
     p.add_argument("--patience",      type=int,   default=50)
     p.add_argument("--warmup_epochs", type=int,   default=50)

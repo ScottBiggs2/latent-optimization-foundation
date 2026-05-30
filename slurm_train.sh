@@ -66,6 +66,7 @@ python run_hpc.py \
     --latent_dim 32 \
     --hidden_dim 256 \
     --cond_dim 64 \
+    --val_fraction 0.0 \
     --epochs 500 \
     --patience 50 \
     --warmup_epochs 50 \

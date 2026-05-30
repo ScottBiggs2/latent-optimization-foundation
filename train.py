@@ -231,16 +231,27 @@ def train_vae(
     # Attach normalization stats — saved in checkpoint, used by eval code
     model.set_code_norm(code_mean, code_std)
 
-    # 80/20 split
-    n_val   = max(1, int(0.2 * N))
-    n_train = N - n_val
+    # Train/val split.
+    # With only ~100 blocks, val_fraction=0 (train on all data) is correct for
+    # exploration: we care about reconstruction fidelity on known weights, not
+    # generalization to unseen architectures.  Use train-loss plateau stopping.
+    val_fraction = getattr(args, "val_fraction", 0.0)
     full_ds = TensorDataset(codes, block_idxs, family_idxs)
-    train_ds, val_ds = random_split(
-        full_ds, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+
+    if val_fraction <= 0.0:
+        train_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=True)
+        val_loader   = None
+        print(f"  Training on all {N} blocks (val_fraction=0, train-loss plateau stopping)")
+    else:
+        n_val   = max(1, int(val_fraction * N))
+        n_train = N - n_val
+        train_ds, val_ds = random_split(
+            full_ds, [n_train, n_val],
+            generator=torch.Generator().manual_seed(42)
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+        print(f"  Train/val split: {n_train} train / {n_val} val")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -275,27 +286,33 @@ def train_vae(
         train_recon /= len(train_loader)
         train_kl    /= len(train_loader)
 
-        # ---- val ----
+        # ---- val (optional) ----
         model.eval()
-        val_loss = val_recon = val_kl = 0.0
-        with torch.no_grad():
-            for codes_b, bidx_b, fidx_b in val_loader:
-                codes_b = codes_b.to(device)
-                bidx_b  = bidx_b.to(device)
-                fidx_b  = fidx_b.to(device)
-                recon, mu, logvar = model(codes_b, bidx_b, fidx_b)
-                loss, rl, kl = model.elbo_loss(recon, codes_b, mu, logvar, beta=beta)
-                val_loss  += loss.item()
-                val_recon += rl.item()
-                val_kl    += kl.item()
-        val_loss  /= len(val_loader)
-        val_recon /= len(val_loader)
-        val_kl    /= len(val_loader)
+        if val_loader is not None:
+            val_loss = val_recon = val_kl = 0.0
+            with torch.no_grad():
+                for codes_b, bidx_b, fidx_b in val_loader:
+                    codes_b = codes_b.to(device)
+                    bidx_b  = bidx_b.to(device)
+                    fidx_b  = fidx_b.to(device)
+                    recon, mu, logvar = model(codes_b, bidx_b, fidx_b)
+                    loss, rl, kl = model.elbo_loss(recon, codes_b, mu, logvar, beta=beta)
+                    val_loss  += loss.item()
+                    val_recon += rl.item()
+                    val_kl    += kl.item()
+            val_loss  /= len(val_loader)
+            val_recon /= len(val_loader)
+            val_kl    /= len(val_loader)
+            monitor_loss = val_loss
+        else:
+            # No val split: use train loss for plateau stopping
+            val_loss = val_recon = val_kl = float("nan")
+            monitor_loss = train_loss
 
-        scheduler.step(val_loss)
+        scheduler.step(monitor_loss)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if monitor_loss < best_val_loss:
+            best_val_loss = monitor_loss
             torch.save(model.state_dict(), vae_path)
             patience_count = 0
         else:
@@ -305,24 +322,32 @@ def train_vae(
             "epoch": epoch, "beta": round(beta, 4),
             "train_loss": round(train_loss, 6), "train_recon": round(train_recon, 6),
             "train_kl": round(train_kl, 6),
-            "val_loss": round(val_loss, 6), "val_recon": round(val_recon, 6),
-            "val_kl": round(val_kl, 6),
+            "val_loss": round(val_loss, 6) if not (val_loss != val_loss) else None,
+            "val_recon": round(val_recon, 6) if not (val_recon != val_recon) else None,
+            "val_kl": round(val_kl, 6) if not (val_kl != val_kl) else None,
         }
         history.append(row)
 
         if epoch % 50 == 0 or epoch == 1:
-            print(f"  epoch {epoch:4d}/{args.epochs}  "
-                  f"train={train_loss:.5f}  val={val_loss:.5f}  "
-                  f"recon={val_recon:.5f}  kl={val_kl:.5f}  beta={beta:.3f}  "
-                  f"patience={patience_count}/{args.patience}")
+            if val_loader is not None:
+                print(f"  epoch {epoch:4d}/{args.epochs}  "
+                      f"train={train_loss:.5f}  val={val_loss:.5f}  "
+                      f"recon={val_recon:.5f}  kl={val_kl:.5f}  beta={beta:.3f}  "
+                      f"patience={patience_count}/{args.patience}")
+            else:
+                print(f"  epoch {epoch:4d}/{args.epochs}  "
+                      f"train={train_loss:.5f}  recon={train_recon:.5f}  "
+                      f"kl={train_kl:.5f}  beta={beta:.3f}  "
+                      f"patience={patience_count}/{args.patience}")
 
         if patience_count >= args.patience:
-            print(f"  Early stopping at epoch {epoch} (best val={best_val_loss:.6f})")
+            label = "val" if val_loader is not None else "train"
+            print(f"  Early stopping at epoch {epoch} (best {label}={best_val_loss:.6f})")
             break
 
     with open(metrics_path, "w") as f:
-        json.dump({"best_val_loss": best_val_loss, "history": history}, f, indent=2)
-    print(f"{ts()} VAE training done — best val_loss={best_val_loss:.6f}")
+        json.dump({"best_monitor_loss": best_val_loss, "history": history}, f, indent=2)
+    print(f"{ts()} VAE training done — best loss={best_val_loss:.6f}")
     print(f"  Checkpoint → {vae_path}")
 
     # Load best weights
@@ -358,6 +383,9 @@ def main():
     p.add_argument("--cond_dim",   type=int, default=64)
 
     # VAE training
+    p.add_argument("--val_fraction",   type=float, default=0.0,
+                   help="Fraction of blocks for validation (0=train on all data, "
+                        "use train-loss plateau stopping — correct for ≤200 blocks)")
     p.add_argument("--epochs",         type=int,   default=500)
     p.add_argument("--patience",       type=int,   default=50)
     p.add_argument("--warmup_epochs",  type=int,   default=50,
