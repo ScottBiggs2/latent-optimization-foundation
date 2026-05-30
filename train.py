@@ -155,7 +155,10 @@ def stage_encode(
 
     if os.path.exists(codes_path) and not args.force_encode:
         print(f"{ts()} Found existing PCA codes at {codes_path} — loading …")
-        codes_np = np.load(codes_path)
+        # pca_codes.npy is a raw memmap binary (no .npy header), not a pickle.
+        N_cached = len(dataset)
+        codes_np = np.array(np.memmap(codes_path, dtype=np.float32, mode="r",
+                                      shape=(N_cached, pca.n_components)))
     else:
         print(f"{ts()} Stage 3: Encoding {len(dataset)} blocks → PCA codes …")
         N = len(dataset)
