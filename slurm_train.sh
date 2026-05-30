@@ -15,11 +15,11 @@
 #SBATCH --error=/scratch/biggs.s/llm_vae/slurm_%j.err
 
 # Resources: V100 (32 GB) is sufficient; upgrade to A100 if OOM
+#SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=v100
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=6:00:00
+#SBATCH --time=06:00:00
 
 set -e
 
