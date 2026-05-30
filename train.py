@@ -196,6 +196,15 @@ def train_vae(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"{ts()} Stage 4: Training VAE on {N} blocks, code_dim={k}, device={device}")
 
+    # Compute per-dimension normalization stats from the full code matrix.
+    # Stored as VAE buffers so they travel with the checkpoint and are
+    # available to evaluation code without a separate file.
+    code_mean = codes.mean(dim=0)
+    code_std  = codes.std(dim=0).clamp(min=1e-8)
+    print(f"  Code scale: mean_abs={code_mean.abs().mean():.2f}, "
+          f"std_mean={code_std.mean():.2f}  "
+          f"(ELBO loss computed in normalized space)")
+
     model = ConditionedBlockVAE(
         code_dim=k,
         latent_dim=args.latent_dim,
@@ -215,6 +224,9 @@ def train_vae(
     }
     with open(cfg_path, "w") as f:
         json.dump(cfg_dict, f, indent=2)
+
+    # Attach normalization stats — saved in checkpoint, used by eval code
+    model.set_code_norm(code_mean, code_std)
 
     # 80/20 split
     n_val   = max(1, int(0.2 * N))

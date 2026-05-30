@@ -81,7 +81,8 @@ def get_wikitext2_loader(
             "Install with: pip install datasets"
         )
 
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1",
+    # datasets 3.x requires namespace/name format; "wikitext" alone is no longer valid.
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1",
                       split=split, cache_dir=cache_dir)
 
     # Concatenate all text, then tokenise in one shot for clean chunking

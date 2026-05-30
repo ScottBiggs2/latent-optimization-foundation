@@ -55,6 +55,12 @@ class ConditionedBlockVAE(nn.Module):
         self.latent_dim = latent_dim
         self.cond_dim   = cond_dim
 
+        # ---- Code normalization (identity until set_code_norm is called) ----
+        # Stored as buffers so they are saved/loaded with the checkpoint and
+        # automatically moved with .to(device).
+        self.register_buffer('_code_mean', torch.zeros(code_dim))
+        self.register_buffer('_code_std',  torch.ones(code_dim))
+
         # ---- Conditioning embeddings ----
         self.block_idx_emb = nn.Embedding(max_blocks, cond_dim)
         self.family_emb    = nn.Embedding(n_families, cond_dim)
@@ -89,6 +95,27 @@ class ConditionedBlockVAE(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    # Code normalization helpers
+    # ------------------------------------------------------------------
+
+    def set_code_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """
+        Store per-dimension normalization stats so they travel with the
+        checkpoint. Call once after the full code matrix is available,
+        before training begins.
+        """
+        self._code_mean.copy_(mean.to(self._code_mean.device))
+        self._code_std.copy_(std.clamp(min=1e-8).to(self._code_std.device))
+
+    def _norm(self, codes: torch.Tensor) -> torch.Tensor:
+        """Raw codes → zero-mean unit-std codes."""
+        return (codes - self._code_mean) / self._code_std
+
+    def _denorm(self, codes_norm: torch.Tensor) -> torch.Tensor:
+        """Normalized codes → raw codes."""
+        return codes_norm * self._code_std + self._code_mean
+
+    # ------------------------------------------------------------------
     # Forward helpers
     # ------------------------------------------------------------------
 
@@ -104,13 +131,13 @@ class ConditionedBlockVAE(nn.Module):
 
     def encode(
         self,
-        codes: torch.Tensor,       # (B, code_dim)
+        codes: torch.Tensor,       # (B, code_dim)  raw PCA codes
         block_idx: torch.Tensor,
         family_idx: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (mu, logvar), each (B, latent_dim)."""
+        """Return (mu, logvar), each (B, latent_dim). Input is raw codes."""
         cond = self._condition(block_idx, family_idx)
-        h = self.encoder(torch.cat([codes, cond], dim=-1))
+        h = self.encoder(torch.cat([self._norm(codes), cond], dim=-1))
         return self.mu_head(h), self.logvar_head(h)
 
     @staticmethod
@@ -128,9 +155,10 @@ class ConditionedBlockVAE(nn.Module):
         block_idx: torch.Tensor,
         family_idx: torch.Tensor,
     ) -> torch.Tensor:
-        """Return reconstructed codes (B, code_dim)."""
+        """Return reconstructed raw codes (B, code_dim). Output is denormalized."""
         cond = self._condition(block_idx, family_idx)
-        return self.decoder(torch.cat([z, cond], dim=-1))
+        codes_norm = self.decoder(torch.cat([z, cond], dim=-1))
+        return self._denorm(codes_norm)
 
     def forward(
         self,
@@ -156,8 +184,8 @@ class ConditionedBlockVAE(nn.Module):
     # Loss
     # ------------------------------------------------------------------
 
-    @staticmethod
     def elbo_loss(
+        self,
         recon: torch.Tensor,
         target: torch.Tensor,
         mu: torch.Tensor,
@@ -165,15 +193,20 @@ class ConditionedBlockVAE(nn.Module):
         beta: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        β-VAE ELBO loss.
+        β-VAE ELBO loss computed in normalized code space for scale stability.
+
+        recon and target are raw codes; the loss divides by _code_std so that
+        the reconstruction term is always O(1) regardless of code magnitude.
 
         Returns
         -------
         total_loss  : scalar
-        recon_loss  : scalar  (MSE reconstruction on PCA codes)
+        recon_loss  : scalar  (MSE in normalized space)
         kl_loss     : scalar  (KL divergence)
         """
-        recon_loss = F.mse_loss(recon, target)
+        recon_norm  = self._norm(recon)
+        target_norm = self._norm(target)
+        recon_loss = F.mse_loss(recon_norm, target_norm)
         kl_loss = -0.5 * torch.mean(
             1 + logvar - mu.pow(2) - logvar.exp()
         )
