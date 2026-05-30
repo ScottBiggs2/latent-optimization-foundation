@@ -111,6 +111,14 @@ To skip LM eval (faster turnaround during debugging):
 EVAL_LM=0 sbatch slurm_train.sh
 ```
 
+### Val split vs. train-on-all
+
+With ~100 blocks, `--val_fraction 0.0` (default) is correct: the VAE needs to memorize
+the training set before it can generalize. A non-zero val split causes immediate
+overfitting — the best checkpoint ends up being the random initialization.
+
+Switch to `--val_fraction 0.1` when the dataset grows to 500+ blocks.
+
 ### Resume a killed job
 All four stages leave checkpoints. Resubmit `slurm_train.sh` unchanged — completed stages are detected and skipped automatically.
 
@@ -155,6 +163,55 @@ python run_hpc.py --force_train        # re-train VAE, keep PCA + codes
 The 64 GB SLURM request is conservative. In practice peak RAM is dominated by one model loaded at a time during extraction (~2–4 GB) plus the PCA component matrix (~2.4 GB).
 
 ---
+
+## Results (first full run)
+
+VAE trained on 108 blocks (24 GPT-2 + 32 SmolLM2 + 28 Qwen3 + 24 OPT), 500 epochs,
+train-loss plateau stopping (`--val_fraction 0.0`). Best normalized ELBO: 0.0023.
+
+### Weight reconstruction
+
+| Model | Cosine sim | MSE |
+|---|---|---|
+| openai-community/gpt2-medium | **0.9997** | 5.9e-6 |
+| HuggingFaceTB/SmolLM2-360M  | **0.9998** | 7.0e-6 |
+| Qwen/Qwen3-0.6B              | **0.9982** | 5.6e-6 |
+| facebook/opt-350m            | 0.772  | 3.4e-4 ⚠️ |
+
+### Perplexity (WikiText-2 test, 512-token sequences)
+
+| Model | Original PPL | Reconstructed PPL | Δ PPL |
+|---|---|---|---|
+| gpt2-medium   | 26.69 | **26.80** | +0.11 (+0.4%) ✅ |
+| SmolLM2-360M  | 14.67 | **14.74** | +0.06 (+0.4%) ✅ |
+| Qwen3-0.6B    | 26.25 | 51.77  | +25.5 (+97%) ⚠️ |
+| OPT-350M      | 33.59 | 1199   | +1165 (+3470%) ❌ |
+
+GPT-2 medium and SmolLM2-360M fully meet the target of < 1 PPL point delta.
+
+### Known issues and next steps
+
+**Qwen3-0.6B PPL sensitivity** — Weight reconstruction is excellent (cosine_sim=0.998)
+but perplexity doubles. Models using explicit `head_dim` and RoPE attention appear
+sensitive to the small residual weight errors; the block structure is captured correctly
+but the architecture is numerically brittle. Possible fix: per-family reconstruction
+fine-tuning or tighter convergence.
+
+**OPT-350M poor reconstruction** — OPT applies biases to every attention projection and
+feed-forward layer. Bias vectors have a fundamentally different statistical distribution
+from weight matrices, which pulls the shared PCA basis in unhelpful directions. Options:
+(a) exclude OPT from the joint model and handle it separately, (b) separate bias
+parameters from weight matrices before PCA, or (c) replace OPT-350M with a bias-free
+alternative (e.g. a LLaMA-family model).
+
+**Dataset size** — With 108 blocks across 4 families, the VAE memorizes rather than
+generalizes. `--val_fraction 0.0` (train on all data) is the correct setting at this
+scale. Switching to `--val_fraction 0.1` becomes meaningful when the dataset grows to
+500+ blocks, e.g. by adding OLMo-2 training checkpoints.
+
+**Gemma 3** — `google/gemma-3-270m` is a gated model. To add it: accept terms at
+huggingface.co/google/gemma-3-270m, set `HF_TOKEN` in `slurm_train.sh`, then add
+`gemma3_270m` to `--arch_list`. Its registry entry (family_idx=4) is already present.
 
 ## Evaluation Targets
 
