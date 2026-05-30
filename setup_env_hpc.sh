@@ -50,8 +50,12 @@ conda create -n "$ENV_NAME" python=3.11 -y
 
 conda activate "$ENV_NAME"
 
-# PyTorch with CUDA 12.1 (matches Explorer's cuda/12.8.0 driver)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# PyTorch 2.6+ with CUDA 12.4 wheels.
+# cu124 is the highest index that carries torch>=2.6, and Explorer's CUDA 12.8
+# driver is forward-compatible with cu124-compiled libraries.
+# (cu121 only goes up to torch 2.5.1, which triggers a transformers safety error
+#  when loading legacy .bin models such as facebook/opt-350m.)
+pip install "torch>=2.6.0" torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # All project dependencies
 pip install \
