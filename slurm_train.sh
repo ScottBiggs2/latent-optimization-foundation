@@ -13,6 +13,10 @@
 #SBATCH --job-name=llm_vae_train
 #SBATCH --output=/scratch/biggs.s/llm_vae/slurm_%j.out
 #SBATCH --error=/scratch/biggs.s/llm_vae/slurm_%j.err
+# SLURM copies the script to its spool dir before running it, so
+# $(dirname "$0") would point there instead of the project root.
+# --chdir is processed before the script executes and reliably sets CWD.
+#SBATCH --chdir=/home/biggs.s/llm_vae
 
 # Resources: V100 (32 GB) is sufficient; upgrade to A100 if OOM
 #SBATCH --partition=gpu
@@ -29,6 +33,10 @@ conda activate llm_vae
 
 # All large files go to scratch — never to $HOME
 export HF_HOME=/scratch/biggs.s/hf_cache
+# HF_TOKEN is required for gated models (e.g. google/gemma-3-270m).
+# The default arch list uses only open-weights models so no token is needed.
+# Uncomment and fill in if you add gemma3_270m back to --arch_list:
+# export HF_TOKEN=hf_your_token_here
 export HF_DATASETS_CACHE=/scratch/biggs.s/hf_cache
 export TRITON_CACHE_DIR=/scratch/biggs.s/triton_cache
 export ARTIFACT_DIR=/scratch/biggs.s/llm_vae
@@ -49,8 +57,6 @@ echo "GPU      : $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "Mode     : $MODE"
 echo "Artifact : $ARTIFACT_DIR"
 echo "=============================================="
-
-cd "$(dirname "$0")"  # run from project root
 
 python run_hpc.py \
     --mode "$MODE" \

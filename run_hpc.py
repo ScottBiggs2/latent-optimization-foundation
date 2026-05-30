@@ -42,7 +42,10 @@ def ts() -> str:
 def main():
     p = argparse.ArgumentParser(description="LLM-VAE HPC runner")
 
-    p.add_argument("--arch_list",  nargs="+", default=list_archs())
+    # Default list excludes gated models (gemma3_270m requires HF_TOKEN + access).
+    # To include Gemma 3: add --arch_list gpt2_medium smollm2_360m gemma3_270m opt_350m
+    _DEFAULT_ARCHS = ["gpt2_medium", "smollm2_360m", "qwen3_0_6b", "opt_350m"]
+    p.add_argument("--arch_list",  nargs="+", default=_DEFAULT_ARCHS)
     p.add_argument("--mode",       choices=["tiny", "full"], default="full")
     p.add_argument("--noise_scale", type=float, default=1e-7)
 

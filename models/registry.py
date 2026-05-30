@@ -70,15 +70,39 @@ ARCH_CONFIGS: dict[str, dict] = {
         ),
     },
 
+    "qwen3_0_6b": {
+        # Qwen3-0.6B — open weights, already cached on Explorer HPC.
+        # LLaMA-style decoder; identical layer layout to smollm2_360m.
+        # Replaces gemma3_270m at family_idx=2 (Gemma 3 is gated and requires
+        # a HF_TOKEN + access approval; kept below as "gemma3_270m" for future use).
+        "default_model_id": "Qwen/Qwen3-0.6B",
+        "hf_model_type":    "qwen3",
+        "layers_attr":      "model.layers",
+        "family_idx":       2,
+        # Real config: 28 layers, hidden=1024, heads=16, kv_heads=8, ffn=3072, head_dim=128
+        "tiny_config": dict(
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,               # Qwen3 requires explicit head_dim
+            intermediate_size=512,
+            vocab_size=1000,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+        ),
+    },
+
+    # ── Gated models (require HF_TOKEN + HuggingFace access approval) ────────
     "gemma3_270m": {
-        # Gemma 3 (Google) — multimodal model; transformer decoder blocks live
-        # inside the language_model sub-module of the outer Gemma3Model.
-        # Path: Gemma3ForCausalLM.model.language_model.layers
+        # Gemma 3 (Google) — multimodal; decoder blocks at model.language_model.layers
+        # Access: https://huggingface.co/google/gemma-3-270m
+        # To use: set HF_TOKEN in slurm_train.sh and add to arch_list.
         "default_model_id": "google/gemma-3-270m",
         "hf_model_type":    "gemma3",
         "layers_attr":      "model.language_model.layers",
-        "family_idx":       2,
-        # Gemma3 config keys mirror Gemma2 but add head_dim
+        "family_idx":       4,         # set to 4 when used alongside the default 4
         "tiny_config": dict(
             hidden_size=128,
             num_hidden_layers=2,
