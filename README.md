@@ -94,7 +94,7 @@ Stage 4 ─ VAE training
 ```bash
 # On Explorer login node, inside the cloned repo:
 bash setup_env_hpc.sh
-mkdir -p /scratch/biggs.s/llm_vae /scratch/biggs.s/hf_cache
+mkdir -p /scratch/biggs.s/llm_vae/scratch/biggs.s/hf_cache
 
 # Set your HuggingFace token (needed for some models):
 export HF_TOKEN=hf_...
@@ -235,7 +235,17 @@ After a successful run, check `results/`:
 > **Gemma 3 note:** `google/gemma-3-270m` is a multimodal model. Its text decoder blocks live at `model.language_model.layers` (already set in the registry), not `model.layers`. If the model ID is unavailable on HuggingFace, substitute the nearest available variant (e.g., `google/gemma-3-1b-pt`).
 
 ---
+### Improvement Plan
 
+1. Add a n+1 family to implement Classifier Free Guidance in the VAE to ensure that family embeddings are information rich conditions. 
+2. Beef up the VAE, current size is quite light given the size of PCA encodings and the weirdness of weight spaces. 
+3. Augment/increase the size of the dataset with:
+   - Spamming Olmo-2 checkpoints
+   - More noise augmentation
+   - Does permuatation augmentation make sense? VAEs should be perm. invariant, but I'm not sure if the PCA is... Although the lesson from DWF was certainly that scale is the critical axis here, so this might be a method? However if the class embeddings are acting as a perm. spec. one-hot type label, then this will eliminate that signal and increase load on PCA or the VAE. 
+4. Richer graph based embeddings for classes. This should allow the model to better generalize to new families with known blocks. 
+
+---
 ## References
 
 - Dual/Gram-matrix PCA algorithm: [NNeuralDynamics/DeepWeightFlow](https://github.com/NNeuralDynamics/DeepWeightFlow)
