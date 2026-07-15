@@ -48,12 +48,15 @@ LLM-VAE-Early/
 │   └── weight_extractor.py  # Block flattening, padding/masking, reconstruction
 ├── data/
 │   ├── block_dataset.py     # BlockDataset: extracts all blocks, writes to memmap
-│   └── val_loader.py        # WikiText-2 DataLoader for perplexity evaluation
+│   ├── val_loader.py        # WikiText-2 DataLoader for perplexity evaluation
+│   └── mc_loader.py         # MMLU / HellaSwag / GPQA loaders for eval_mc.py
 ├── dual_pca.py              # BatchedCovariancePCA with save/load (float16 on disk)
 ├── vae.py                   # ConditionedBlockVAE + BetaScheduler (KL warmup)
 ├── train.py                 # Four-stage pipeline with checkpoint/resume
 ├── evaluate.py              # Block reconstruction metrics (cosine sim, MSE, KL)
 ├── eval_lm.py               # LM perplexity: original vs. reconstructed model
+├── eval_mc.py               # MMLU/HellaSwag/GPQA accuracy: original vs. reconstructed (opt-in, --eval_mc)
+├── report.py                # Aggregates results/*.json into a markdown report (pure stdlib)
 ├── run_demo.py              # Local entry point (--mode tiny skips all downloads)
 ├── run_hpc.py               # HPC entry point; defaults to /scratch/biggs.s/llm_vae
 ├── slurm_train.sh           # SLURM job (V100, 64G RAM, 6h)
@@ -213,6 +216,40 @@ scale. Switching to `--val_fraction 0.1` becomes meaningful when the dataset gro
 huggingface.co/google/gemma-3-270m, set `HF_TOKEN` in `slurm_train.sh`, then add
 `gemma3_270m` to `--arch_list`. Its registry entry (family_idx=4) is already present.
 
+## Multiple-Choice Benchmarks (MMLU / HellaSwag / GPQA)
+
+`eval_mc.py` extends the reconstruction evaluation beyond WikiText-2 PPL to
+downstream multiple-choice accuracy. It's opt-in — enable with `--eval_mc`
+(`run_hpc.py`) or `MC_EVAL=1` (`slurm_train.sh`) — since it adds real runtime
+and dataset downloads on top of the default pipeline.
+
+All four registered architectures are base pretrained models (no chat
+template), so every benchmark is scored by ranking answer continuations via
+log-likelihood under the model (`eval_mc.score_choices`) rather than
+chat-formatted generation — see `data/mc_loader.py` for per-benchmark prompt
+construction (5-shot for MMLU, 0-shot for HellaSwag, few-shot for GPQA).
+
+**GPQA gating** — `Idavidrein/gpqa` is a gated dataset, same pattern as
+Gemma 3: accept terms at huggingface.co/datasets/Idavidrein/gpqa and set
+`HF_TOKEN` before running with `MC_EVAL=1` (or drop `gpqa` from
+`--mc_benchmarks`). Expect near-chance accuracy (~25%) on these small base
+models — the before/after delta is the meaningful signal, not absolute score.
+
+Results are saved to `results/mc_eval_results.json`.
+
+### Reporting
+
+`report.py` aggregates whichever of `reconstruction_results.json` /
+`lm_eval_results.json` / `mc_eval_results.json` exist in a results directory
+into one markdown report. Pure stdlib, no torch/transformers import, so it's
+safe to run locally against results copied down from Explorer (e.g. `scp -r
+explorer:/scratch/biggs.s/llm_vae/results ./results`):
+
+```bash
+python report.py --results_dir ./results              # print to stdout
+python report.py --results_dir ./results --output report.md
+```
+
 ## Evaluation Targets
 
 After a successful run, check `results/`:
@@ -222,6 +259,7 @@ After a successful run, check `results/`:
 | Block cosine similarity | > 0.999 | reconstruction_results.json |
 | Block MSE | < 1e-8 | reconstruction_results.json |
 | PPL delta (vs. original) | < 1.0 ppl point per family | lm_eval_results.json |
+| MMLU/HellaSwag/GPQA acc delta (vs. original) | as close to 0 as possible per family | mc_eval_results.json |
 
 ---
 

@@ -28,6 +28,12 @@ import torch.nn as nn
 # Architecture configs
 # ---------------------------------------------------------------------------
 
+# Additional Candidates
+# * Gemma 3 270M (fix HF token thingy)
+# * SmolLM 135M
+# * Eleuther Pythia 160M and 410M (amazing sources of checkpoints alongside Olmo & SmolLM - keep in mind for future!)
+# * other stuff? 
+
 ARCH_CONFIGS: dict[str, dict] = {
     "gpt2_medium": {
         # ---- HuggingFace identifiers ----
@@ -115,7 +121,7 @@ ARCH_CONFIGS: dict[str, dict] = {
             rms_norm_eps=1e-6,
         ),
     },
-
+    # Biases included ends up breaking the PCA - remove from arch_list
     "opt_350m": {
         # OPTForCausalLM — pre-norm, biases on all projections
         "default_model_id": "facebook/opt-350m",

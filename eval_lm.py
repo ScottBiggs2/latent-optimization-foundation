@@ -32,6 +32,11 @@ from vae import ConditionedBlockVAE
 # Perplexity measurement
 # ---------------------------------------------------------------------------
 
+# Need to expand with more metrics in the future. Check how bedio did it (screenshot)
+# Add: MMLUU, GPQA, HellaSwag
+# Don't bother with vLLM fuckery - just use torch/transformers for simplicity. 
+# Make sure that the chat templates are correct!
+
 def compute_perplexity(
     model: nn.Module,
     dataloader,

@@ -81,6 +81,12 @@ def main():
     p.add_argument("--eval_seq_len",     type=int, default=512)
     p.add_argument("--eval_n_sequences", type=int, default=32)
 
+    # Multiple-choice benchmarks (opt-in — adds real runtime + dataset
+    # downloads on top of the WikiText-2 PPL eval above).
+    p.add_argument("--eval_mc",          action="store_true", default=False)
+    p.add_argument("--mc_benchmarks",    nargs="+", default=["mmlu", "hellaswag", "gpqa"])
+    p.add_argument("--mc_n_questions",   type=int, default=200)
+
     args = p.parse_args()
 
     # Ensure scratch dirs exist
@@ -155,6 +161,28 @@ def main():
                   f"{res['reconstructed_ppl']:.2f}  "
                   f"(Δ={res['ppl_delta']:+.3f}, {res['ppl_delta_pct']:+.2f}%)")
         print(f"  Saved → {lm_path}")
+
+    if args.eval_mc:
+        print(f"\n{ts()} Stage 7: Multiple-choice benchmark evaluation …")
+        from eval_mc import evaluate_all_families_mc
+        mc_results = evaluate_all_families_mc(
+            pca, vae, dataset,
+            benchmarks=tuple(args.mc_benchmarks),
+            n_questions=args.mc_n_questions,
+            artifact_dir=args.artifact_dir,
+        )
+        mc_path = os.path.join(res_dir, "mc_eval_results.json")
+        with open(mc_path, "w") as f:
+            json.dump(mc_results, f, indent=2)
+        print(f"\n  Multiple-choice evaluation summary:")
+        for arch, res in mc_results.items():
+            for bench in args.mc_benchmarks:
+                r = res[bench]
+                print(f"  {arch} [{bench}]: acc {r['original_acc']:.3f} → "
+                      f"{r['reconstructed_acc']:.3f}  (Δ={r['acc_delta']:+.3f})  "
+                      f"acc_norm {r['original_acc_norm']:.3f} → "
+                      f"{r['reconstructed_acc_norm']:.3f}  (Δ={r['acc_norm_delta']:+.3f})")
+        print(f"  Saved → {mc_path}")
 
     print(f"\n{ts()} All done. Results in {res_dir}")
 
