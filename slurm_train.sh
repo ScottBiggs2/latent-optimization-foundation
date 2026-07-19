@@ -11,11 +11,15 @@
 #   EVAL_LM=0 sbatch slurm_train.sh    # skip LM eval to save time
 #   MC_EVAL=1 sbatch slurm_train.sh    # also run MMLU/HellaSwag/GPQA eval
 #
+# The default --arch_list (run_hpc.py) now includes gemma3_270m, which is
+# gated: accept terms at huggingface.co/google/gemma-3-270m and set HF_TOKEN
+# below before submitting.
+#
 # MC_EVAL requires GPQA access: accept terms at
-# huggingface.co/datasets/Idavidrein/gpqa and set HF_TOKEN below (same
-# gating pattern as gemma3_270m). Training/PCA/VAE stages are checkpointed,
-# so resubmitting with MC_EVAL=1 on an existing artifact_dir skips straight
-# to the new evaluation stage.
+# huggingface.co/datasets/Idavidrein/gpqa (same gating pattern, same
+# HF_TOKEN). Training/PCA/VAE stages are checkpointed, so resubmitting with
+# MC_EVAL=1 on an existing artifact_dir skips straight to the new evaluation
+# stage.
 
 #SBATCH --job-name=llm_vae_train
 #SBATCH --output=/scratch/biggs.s/llm_vae/slurm_%j.out
@@ -40,10 +44,10 @@ conda activate llm_vae
 
 # All large files go to scratch — never to $HOME
 export HF_HOME=/scratch/biggs.s/hf_cache
-# HF_TOKEN is required for gated models/datasets (e.g. google/gemma-3-270m,
-# or the GPQA dataset used by MC_EVAL). The default config needs no token.
-# Uncomment and fill in if you add gemma3_270m to --arch_list, or set MC_EVAL=1:
-# export HF_TOKEN=hf_your_token_here
+# HF_TOKEN is required for gated models/datasets — gemma3_270m is now in the
+# default --arch_list (run_hpc.py), and the GPQA dataset used by MC_EVAL=1
+# needs it too. Fill in your token below:
+export HF_TOKEN=hf_your_token_here
 export HF_DATASETS_CACHE=/scratch/biggs.s/hf_cache
 export TRITON_CACHE_DIR=/scratch/biggs.s/triton_cache
 export ARTIFACT_DIR=/scratch/biggs.s/llm_vae

@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.registry import MAX_BLOCKS, N_FAMILIES
+
 
 class ConditionedBlockVAE(nn.Module):
     """
@@ -46,8 +48,8 @@ class ConditionedBlockVAE(nn.Module):
         latent_dim: int = 32,
         hidden_dim: int = 256,
         cond_dim: int = 64,
-        max_blocks: int = 40,
-        n_families: int = 4,
+        max_blocks: int = MAX_BLOCKS,
+        n_families: int = N_FAMILIES,
     ):
         super().__init__()
 

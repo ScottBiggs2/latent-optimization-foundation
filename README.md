@@ -26,16 +26,20 @@ The VAE encoder and decoder each receive a conditioning vector formed by concate
 
 ### Data and augmentation
 
-Training data is the actual pre-trained weights from four models of similar scale:
+Training data is the actual pre-trained weights from the default `--arch_list` (`run_hpc.py`):
 
-| Model | Params | Layers | Hidden | Family idx |
-|---|---|---|---|---|
-| openai-community/gpt2-medium | 355M | 24 | 1024 | 0 |
-| HuggingFaceTB/SmolLM2-360M | 360M | 32 | 960 | 1 |
-| google/gemma-3-270m | ~270M | ~18 | ~1152 | 2 |
-| facebook/opt-350m | 350M | 24 | 512 | 3 |
+| Model | Params | Layers | Hidden | Family idx | Default? |
+|---|---|---|---|---|---|
+| openai-community/gpt2-medium | 355M | 24 | 1024 | 0 | yes |
+| HuggingFaceTB/SmolLM2-360M | 360M | 32 | 960 | 1 | yes |
+| Qwen/Qwen3-0.6B | 0.6B | 28 | 1024 | 2 | yes |
+| facebook/opt-350m | 350M | 24 | 512 | 3 | **no** — biases break the shared PCA basis, see Known Issues |
+| google/gemma-3-270m | ~270M | ~18 | ~1152 | 4 | yes — gated, requires `HF_TOKEN` |
+| HuggingFaceTB/SmolLM2-135M | 135M | 30 | 576 | 5 | yes |
+| EleutherAI/pythia-160m | 160M | 12 | 768 | 6 | yes |
+| EleutherAI/pythia-410m | 410M | 24 | 1024 | 7 | yes |
 
-Extracting all blocks gives ~100 base training samples. On-the-fly noise augmentation (σ ≤ 1e-6 × block std) smooths learning dynamics at negligible cost.
+Extracting all blocks across the default roster gives a few hundred base training samples. On-the-fly noise augmentation (σ ≤ 1e-6 × block std) smooths learning dynamics at negligible cost.
 
 ---
 
@@ -44,7 +48,7 @@ Extracting all blocks gives ~100 base training samples. On-the-fly noise augment
 ```
 LLM-VAE-Early/
 ├── models/
-│   ├── registry.py          # ARCH_CONFIGS for all 4 families + tiny mocks
+│   ├── registry.py          # ARCH_CONFIGS for all 8 families + tiny mocks
 │   └── weight_extractor.py  # Block flattening, padding/masking, reconstruction
 ├── data/
 │   ├── block_dataset.py     # BlockDataset: extracts all blocks, writes to memmap
@@ -169,6 +173,12 @@ The 64 GB SLURM request is conservative. In practice peak RAM is dominated by on
 
 ## Results (first full run)
 
+> These results are from the original 4-family roster (below), before the registry
+> expansion that added smollm2_135m/pythia_160m/pythia_410m, promoted gemma3_270m
+> into the default `--arch_list`, and dropped opt_350m from it (see "Known issues"
+> below). Pending a re-run on the new 7-family default — this table will be stale
+> until then.
+
 VAE trained on 108 blocks (24 GPT-2 + 32 SmolLM2 + 28 Qwen3 + 24 OPT), 500 epochs,
 train-loss plateau stopping (`--val_fraction 0.0`). Best normalized ELBO: 0.0023.
 
@@ -205,16 +215,27 @@ feed-forward layer. Bias vectors have a fundamentally different statistical dist
 from weight matrices, which pulls the shared PCA basis in unhelpful directions. Options:
 (a) exclude OPT from the joint model and handle it separately, (b) separate bias
 parameters from weight matrices before PCA, or (c) replace OPT-350M with a bias-free
-alternative (e.g. a LLaMA-family model).
+alternative (e.g. a LLaMA-family model). **Resolved as (a)**: `opt_350m` stays
+registered for reference but is no longer in `run_hpc.py`'s default `--arch_list` —
+pass it explicitly via `--arch_list` if you want it back. Note that the new
+`pythia_160m`/`pythia_410m` entries carry the same per-projection biases as OPT, so
+they carry the same reconstruction-quality risk; watch their cosine-sim/PPL numbers
+on the next run.
 
 **Dataset size** — With 108 blocks across 4 families, the VAE memorizes rather than
 generalizes. `--val_fraction 0.0` (train on all data) is the correct setting at this
 scale. Switching to `--val_fraction 0.1` becomes meaningful when the dataset grows to
-500+ blocks, e.g. by adding OLMo-2 training checkpoints.
+500+ blocks, e.g. by adding OLMo-2 or Pythia checkpoint-series training snapshots
+(EleutherAI publishes intermediate checkpoints throughout pretraining for every
+Pythia size, alongside Olmo-2 and SmolLM — a cheap way to multiply block count
+without adding new architectures).
 
-**Gemma 3** — `google/gemma-3-270m` is a gated model. To add it: accept terms at
-huggingface.co/google/gemma-3-270m, set `HF_TOKEN` in `slurm_train.sh`, then add
-`gemma3_270m` to `--arch_list`. Its registry entry (family_idx=4) is already present.
+**Gemma 3** — `google/gemma-3-270m` is a gated model, now included in
+`run_hpc.py`'s default `--arch_list`. To use it: accept terms at
+huggingface.co/google/gemma-3-270m and set `HF_TOKEN` in `slurm_train.sh` (required
+for the default run now, not just as an opt-in extra). Its registry entry
+(family_idx=4) has been in place for a while; this expansion is what actually
+exercises the gated download path end-to-end for the first time.
 
 ## Multiple-Choice Benchmarks (MMLU / HellaSwag / GPQA)
 
@@ -223,7 +244,7 @@ downstream multiple-choice accuracy. It's opt-in — enable with `--eval_mc`
 (`run_hpc.py`) or `MC_EVAL=1` (`slurm_train.sh`) — since it adds real runtime
 and dataset downloads on top of the default pipeline.
 
-All four registered architectures are base pretrained models (no chat
+All registered architectures are base pretrained models (no chat
 template), so every benchmark is scored by ranking answer continuations via
 log-likelihood under the model (`eval_mc.score_choices`) rather than
 chat-formatted generation — see `data/mc_loader.py` for per-benchmark prompt

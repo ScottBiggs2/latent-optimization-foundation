@@ -28,11 +28,11 @@ import torch.nn as nn
 # Architecture configs
 # ---------------------------------------------------------------------------
 
-# Additional Candidates
-# * Gemma 3 270M (fix HF token thingy)
-# * SmolLM 135M
-# * Eleuther Pythia 160M and 410M (amazing sources of checkpoints alongside Olmo & SmolLM - keep in mind for future!)
-# * other stuff? 
+# Added: SmolLM2-135M, Pythia-160M, Pythia-410M (see below). Gemma 3 270M's
+# HF_TOKEN gating is exercised via run_hpc.py's default arch_list now instead
+# of being deferred indefinitely. OPT-350M stays registered but excluded from
+# the default arch_list (see its entry below).
+# Other future candidates? Olmo-2 checkpoint series (see README improvement plan).
 
 ARCH_CONFIGS: dict[str, dict] = {
     "gpt2_medium": {
@@ -139,6 +139,71 @@ ARCH_CONFIGS: dict[str, dict] = {
             max_position_embeddings=512,
         ),
     },
+
+    "smollm2_135m": {
+        # LlamaForCausalLM — same family as smollm2_360m, narrower hidden dim.
+        "default_model_id": "HuggingFaceTB/SmolLM2-135M",
+        "hf_model_type":    "llama",
+        "layers_attr":      "model.layers",
+        "family_idx":       5,
+        # Real config: 30 layers, hidden=576, heads=9, kv_heads=3, ffn=1536
+        "tiny_config": dict(
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,     # GQA: 2 KV heads
+            intermediate_size=512,
+            vocab_size=1000,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+        ),
+    },
+
+    # Pythia (GPT-NeoX) linear layers carry biases on every projection, same
+    # as OPT — same PCA-pollution risk documented on opt_350m below applies
+    # here too. Added anyway per the "amazing source of checkpoints" note;
+    # keep an eye on their reconstruction quality once trained.
+    "pythia_160m": {
+        # GPTNeoXForCausalLM: blocks live at model.gpt_neox.layers
+        "default_model_id": "EleutherAI/pythia-160m",
+        "hf_model_type":    "gpt_neox",
+        "layers_attr":      "gpt_neox.layers",
+        "family_idx":       6,
+        # Real config: 12 layers, hidden=768, heads=12, ffn=3072
+        "tiny_config": dict(
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=512,
+            vocab_size=1000,
+            max_position_embeddings=512,
+            rotary_pct=0.25,
+            rotary_emb_base=10000,
+            layer_norm_eps=1e-5,
+            use_parallel_residual=True,
+        ),
+    },
+    "pythia_410m": {
+        # GPTNeoXForCausalLM: blocks live at model.gpt_neox.layers
+        "default_model_id": "EleutherAI/pythia-410m",
+        "hf_model_type":    "gpt_neox",
+        "layers_attr":      "gpt_neox.layers",
+        "family_idx":       7,
+        # Real config: 24 layers, hidden=1024, heads=16, ffn=4096
+        "tiny_config": dict(
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=512,
+            vocab_size=1000,
+            max_position_embeddings=512,
+            rotary_pct=0.25,
+            rotary_emb_base=10000,
+            layer_norm_eps=1e-5,
+            use_parallel_residual=True,
+        ),
+    },
 }
 
 N_FAMILIES = len(ARCH_CONFIGS)
@@ -148,7 +213,9 @@ MAX_BLOCKS = max(
     cfg.get("n_layers_hint", 40)        # conservative upper bound
     for cfg in ARCH_CONFIGS.values()
 )
-# Actual upper bound: SmolLM2-360M has 32 layers, so 40 is a safe ceiling.
+# Actual upper bound: SmolLM2-360M has 32 layers (the tallest of all
+# registered archs — smollm2_135m=30, pythia_410m=24, pythia_160m=12), so
+# 40 is a safe ceiling.
 MAX_BLOCKS = 40
 
 

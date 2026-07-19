@@ -34,12 +34,28 @@ from vae import ConditionedBlockVAE
 # Log-likelihood choice scoring
 # ---------------------------------------------------------------------------
 
+def get_max_context_length(model: nn.Module, default: int = 1024) -> int:
+    """
+    Read the model's max sequence length from its config.
+
+    Different architectures name this differently: GPT-2 uses n_positions/
+    n_ctx, Llama/Qwen/OPT-style configs use max_position_embeddings.
+    """
+    cfg = model.config
+    for attr in ("max_position_embeddings", "n_positions", "n_ctx"):
+        val = getattr(cfg, attr, None)
+        if val:
+            return int(val)
+    return default
+
+
 def score_choices(
     model: nn.Module,
     tokenizer,
     context: str,
     choices: list[str],
     device: torch.device,
+    max_length: int = 1024,
 ) -> Tuple[list[float], list[float]]:
     """
     Score each choice as a continuation of context by log-likelihood.
@@ -48,6 +64,13 @@ def score_choices(
     token ids are recovered by slicing off the context-length prefix —
     this avoids BPE boundary mismatches from encoding pieces separately
     (the standard lm-eval-harness trick).
+
+    Few-shot contexts (MMLU/GPQA) can exceed a small model's max position
+    embeddings (e.g. GPT-2-medium's 1024), which crashes the forward pass
+    with an out-of-range position index. When the joint encoding would
+    exceed max_length, the context is truncated from the left (dropping
+    the oldest few-shot examples first) so the full continuation is always
+    scored intact.
 
     Returns
     -------
@@ -67,6 +90,10 @@ def score_choices(
             sum_logprobs.append(float("-inf"))
             mean_logprobs.append(float("-inf"))
             continue
+
+        if len(full_ids) > max_length:
+            keep_context = max(0, max_length - len(continuation_ids))
+            full_ids = context_ids[-keep_context:] + continuation_ids if keep_context > 0 else continuation_ids[-max_length:]
 
         input_ids = torch.tensor(full_ids, dtype=torch.long, device=device).unsqueeze(0)
         with torch.no_grad():
@@ -91,6 +118,7 @@ def compute_mc_accuracy(
     tokenizer,
     examples: Iterable[MCExample],
     device: torch.device,
+    max_length: int = 1024,
 ) -> dict:
     """
     Score a set of MCExamples and return acc / acc_norm.
@@ -103,7 +131,7 @@ def compute_mc_accuracy(
     n_correct_norm = 0
 
     for ex in examples:
-        sum_lp, mean_lp = score_choices(model, tokenizer, ex.context, ex.choices, device)
+        sum_lp, mean_lp = score_choices(model, tokenizer, ex.context, ex.choices, device, max_length=max_length)
         pred = max(range(len(sum_lp)), key=lambda i: sum_lp[i])
         pred_norm = max(range(len(mean_lp)), key=lambda i: mean_lp[i])
         n += 1
@@ -153,6 +181,9 @@ def evaluate_family_mc(
         trust_remote_code=True,
     )
 
+    max_length = get_max_context_length(model)
+    print(f"  [{arch}] Model max context length: {max_length}")
+
     examples_by_bench: dict[str, list[MCExample]] = {}
     for bench in benchmarks:
         print(f"  [{arch}] Loading {bench} ({n_questions} questions) …")
@@ -161,7 +192,7 @@ def evaluate_family_mc(
     original: dict[str, dict] = {}
     for bench, examples in examples_by_bench.items():
         print(f"  [{arch}] Measuring original {bench} accuracy …")
-        original[bench] = compute_mc_accuracy(model, tokenizer, examples, device)
+        original[bench] = compute_mc_accuracy(model, tokenizer, examples, device, max_length=max_length)
         print(f"  [{arch}] Original {bench}: acc={original[bench]['acc']:.3f}  "
               f"acc_norm={original[bench]['acc_norm']:.3f}")
 
@@ -171,7 +202,7 @@ def evaluate_family_mc(
     reconstructed: dict[str, dict] = {}
     for bench, examples in examples_by_bench.items():
         print(f"  [{arch}] Measuring reconstructed {bench} accuracy …")
-        reconstructed[bench] = compute_mc_accuracy(model, tokenizer, examples, device)
+        reconstructed[bench] = compute_mc_accuracy(model, tokenizer, examples, device, max_length=max_length)
         print(f"  [{arch}] Reconstructed {bench}: acc={reconstructed[bench]['acc']:.3f}  "
               f"acc_norm={reconstructed[bench]['acc_norm']:.3f}")
 

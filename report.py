@@ -28,11 +28,14 @@ from typing import Optional
 # dict here (rather than importing models.registry) so this script has zero
 # heavy imports.
 ARCH_DISPLAY_NAMES = {
-    "gpt2_medium":  "openai-community/gpt2-medium",
-    "smollm2_360m": "HuggingFaceTB/SmolLM2-360M",
-    "qwen3_0_6b":   "Qwen/Qwen3-0.6B",
-    "gemma3_270m":  "google/gemma-3-270m",
-    "opt_350m":     "facebook/opt-350m",
+    "gpt2_medium":   "openai-community/gpt2-medium",
+    "smollm2_360m":  "HuggingFaceTB/SmolLM2-360M",
+    "qwen3_0_6b":    "Qwen/Qwen3-0.6B",
+    "gemma3_270m":   "google/gemma-3-270m",
+    "opt_350m":      "facebook/opt-350m",
+    "smollm2_135m":  "HuggingFaceTB/SmolLM2-135M",
+    "pythia_160m":   "EleutherAI/pythia-160m",
+    "pythia_410m":   "EleutherAI/pythia-410m",
 }
 
 

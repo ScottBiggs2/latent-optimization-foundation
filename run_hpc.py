@@ -42,9 +42,13 @@ def ts() -> str:
 def main():
     p = argparse.ArgumentParser(description="LLM-VAE HPC runner")
 
-    # Default list excludes gated models (gemma3_270m requires HF_TOKEN + access).
-    # To include Gemma 3: add --arch_list gpt2_medium smollm2_360m gemma3_270m opt_350m
-    _DEFAULT_ARCHS = ["gpt2_medium", "smollm2_360m", "qwen3_0_6b", "opt_350m"]
+    # gemma3_270m is gated — requires HF_TOKEN exported (see slurm_train.sh)
+    # and license acceptance at huggingface.co/google/gemma-3-270m.
+    # opt_350m is excluded: its per-projection biases pollute the shared PCA
+    # basis (see README "Known issues"). It stays registered for reference —
+    # pass it explicitly via --arch_list if you want it back.
+    _DEFAULT_ARCHS = ["gpt2_medium", "smollm2_360m", "qwen3_0_6b", "gemma3_270m",
+                       "smollm2_135m", "pythia_160m", "pythia_410m"]
     p.add_argument("--arch_list",  nargs="+", default=_DEFAULT_ARCHS)
     p.add_argument("--mode",       choices=["tiny", "full"], default="full")
     p.add_argument("--noise_scale", type=float, default=1e-7)
