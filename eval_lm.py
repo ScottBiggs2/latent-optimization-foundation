@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import math
+import os
 from typing import Optional
 
 import numpy as np
@@ -232,7 +233,10 @@ def evaluate_all_families(
     artifact_dir: str = "/scratch/biggs.s/llm_vae",
 ) -> dict:
     """Run LM eval for every arch in dataset.arch_list."""
-    hf_cache = None if mode == "tiny" else artifact_dir + "/hf_cache"
+    # Share the same cache as the extract stage (registry.load_model falls
+    # back to HF_HOME) instead of a separate artifact_dir-local one — otherwise
+    # a single training run splits its downloads across two disjoint caches.
+    hf_cache = None if mode == "tiny" else os.environ.get("HF_HOME", artifact_dir + "/hf_cache")
     results = {}
     for arch in dataset.arch_list:
         results[arch] = evaluate_family(

@@ -124,7 +124,10 @@ def main():
 
     args = p.parse_args()
 
-    hf_cache = os.path.join(args.artifact_dir, "hf_cache")
+    # Share the same cache as run_hpc.py / registry.py (HF_HOME, set above)
+    # instead of a separate artifact_dir-local one — otherwise gated-model
+    # downloads and access grants split across two disjoint cache dirs.
+    hf_cache = os.environ["HF_HOME"]
     res_dir = os.path.join(args.artifact_dir, "results")
     os.makedirs(res_dir, exist_ok=True)
 

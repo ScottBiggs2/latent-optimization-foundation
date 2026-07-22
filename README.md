@@ -101,7 +101,6 @@ Stage 4 ─ VAE training
 ```bash
 # On Explorer login node, inside the cloned repo:
 bash setup_env_hpc.sh
-mkdir -p /scratch/biggs.s/llm_vae/scratch/biggs.s/hf_cache
 
 # Set your HuggingFace token (needed for some models):
 export HF_TOKEN=hf_...
@@ -232,8 +231,10 @@ without adding new architectures).
 
 **Gemma 3** — `google/gemma-3-270m` is a gated model, now included in
 `run_hpc.py`'s default `--arch_list`. To use it: accept terms at
-huggingface.co/google/gemma-3-270m and set `HF_TOKEN` in `slurm_train.sh` (required
-for the default run now, not just as an opt-in extra). Its registry entry
+huggingface.co/google/gemma-3-270m, then `export HF_TOKEN=hf_...` in your
+shell before `sbatch slurm_train.sh` (required for the default run now, not
+just as an opt-in extra) — `sbatch` inherits it automatically, so it does not
+need to be edited into the script. Its registry entry
 (family_idx=4) has been in place for a while; this expansion is what actually
 exercises the gated download path end-to-end for the first time.
 

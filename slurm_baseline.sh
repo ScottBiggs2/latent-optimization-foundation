@@ -15,8 +15,11 @@
 #   SKIP_PPL=1 sbatch slurm_baseline.sh                       # MC only
 #   SKIP_MC=1 sbatch slurm_baseline.sh                        # PPL only
 #
-# GPQA requires accepting terms at huggingface.co/datasets/Idavidrein/gpqa
-# and setting HF_TOKEN below (same gating pattern as gemma3_270m).
+# GPQA requires accepting terms at huggingface.co/datasets/Idavidrein/gpqa,
+# then exporting HF_TOKEN in your shell before submitting (same gating
+# pattern as gemma3_270m — see slurm_train.sh):
+#   export HF_TOKEN=hf_...  &&  sbatch slurm_baseline.sh
+# Do NOT hardcode a token into this file — it's tracked by git.
 
 #SBATCH --job-name=llm_vae_baseline
 #SBATCH --output=/scratch/biggs.s/llm_vae/slurm_baseline_%j.out
@@ -35,8 +38,8 @@ source ~/miniconda/etc/profile.d/conda.sh
 conda activate llm_vae
 
 export HF_HOME=/scratch/biggs.s/hf_cache
-# Uncomment for GPQA / gemma3_270m:
-# export HF_TOKEN=hf_your_token_here
+# HF_TOKEN (if needed for GPQA / gemma3_270m) is picked up from the
+# submitting shell's environment via sbatch — nothing to export here.
 export HF_DATASETS_CACHE=/scratch/biggs.s/hf_cache
 export TRITON_CACHE_DIR=/scratch/biggs.s/triton_cache
 export ARTIFACT_DIR=/scratch/biggs.s/llm_vae

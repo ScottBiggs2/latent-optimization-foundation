@@ -12,8 +12,10 @@
 #   MC_EVAL=1 sbatch slurm_train.sh    # also run MMLU/HellaSwag/GPQA eval
 #
 # The default --arch_list (run_hpc.py) now includes gemma3_270m, which is
-# gated: accept terms at huggingface.co/google/gemma-3-270m and set HF_TOKEN
-# below before submitting.
+# gated: accept terms at huggingface.co/google/gemma-3-270m, then export
+# HF_TOKEN in your shell before submitting — sbatch inherits it automatically:
+#   export HF_TOKEN=hf_...  &&  sbatch slurm_train.sh
+# Do NOT hardcode a token into this file — it's tracked by git.
 #
 # MC_EVAL requires GPQA access: accept terms at
 # huggingface.co/datasets/Idavidrein/gpqa (same gating pattern, same
@@ -46,8 +48,11 @@ conda activate llm_vae
 export HF_HOME=/scratch/biggs.s/hf_cache
 # HF_TOKEN is required for gated models/datasets — gemma3_270m is now in the
 # default --arch_list (run_hpc.py), and the GPQA dataset used by MC_EVAL=1
-# needs it too. Fill in your token below:
-export HF_TOKEN=hf_your_token_here
+# needs it too. Export it in your shell before running sbatch (see header
+# comment above) — fail fast here instead of silently running unauthenticated
+# if it wasn't:
+: "${HF_TOKEN:?HF_TOKEN is not set — export it in your shell before sbatch, see header comment}"
+export HF_TOKEN
 export HF_DATASETS_CACHE=/scratch/biggs.s/hf_cache
 export TRITON_CACHE_DIR=/scratch/biggs.s/triton_cache
 export ARTIFACT_DIR=/scratch/biggs.s/llm_vae

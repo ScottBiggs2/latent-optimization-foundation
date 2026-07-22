@@ -1,0 +1,86 @@
+{
+  "gpt2_medium": {
+    "arch": "gpt2_medium",
+    "ppl": 26.69028182712013,
+    "ce_loss": 3.284299522638321,
+    "n_tokens": 16352,
+    "mmlu": {
+      "acc": 0.225,
+      "acc_norm": 0.225,
+      "n_examples": 200
+    },
+    "hellaswag": {
+      "acc": 0.33,
+      "acc_norm": 0.36,
+      "n_examples": 200
+    },
+    "gpqa": {
+      "acc": 0.245,
+      "acc_norm": 0.245,
+      "n_examples": 200
+    }
+  },
+  "smollm2_360m": {
+    "arch": "smollm2_360m",
+    "ppl": 14.671420290112605,
+    "ce_loss": 2.685901403427124,
+    "n_tokens": 16352,
+    "mmlu": {
+      "acc": 0.285,
+      "acc_norm": 0.285,
+      "n_examples": 200
+    },
+    "hellaswag": {
+      "acc": 0.385,
+      "acc_norm": 0.475,
+      "n_examples": 200
+    },
+    "gpqa": {
+      "acc": 0.285,
+      "acc_norm": 0.285,
+      "n_examples": 200
+    }
+  },
+  "qwen3_0_6b": {
+    "arch": "qwen3_0_6b",
+    "ppl": 26.254049766788874,
+    "ce_loss": 3.267820253968239,
+    "n_tokens": 16352,
+    "mmlu": {
+      "acc": 0.455,
+      "acc_norm": 0.455,
+      "n_examples": 200
+    },
+    "hellaswag": {
+      "acc": 0.35,
+      "acc_norm": 0.365,
+      "n_examples": 200
+    },
+    "gpqa": {
+      "acc": 0.26,
+      "acc_norm": 0.26,
+      "n_examples": 200
+    }
+  },
+  "opt_350m": {
+    "arch": "opt_350m",
+    "ppl": 33.591419781483765,
+    "ce_loss": 3.514270670711994,
+    "n_tokens": 16352,
+    "mmlu": {
+      "acc": 0.26,
+      "acc_norm": 0.26,
+      "n_examples": 200
+    },
+    "hellaswag": {
+      "acc": 0.335,
+      "acc_norm": 0.33,
+      "n_examples": 200
+    },
+    "gpqa": {
+      "acc": 0.3,
+      "acc_norm": 0.3,
+      "n_examples": 200
+    }
+  }
+}

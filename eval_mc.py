@@ -17,6 +17,7 @@ per-benchmark prompt construction.
 from __future__ import annotations
 
 import gc
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -239,7 +240,9 @@ def evaluate_all_families_mc(
     artifact_dir: str = "/scratch/biggs.s/llm_vae",
 ) -> dict:
     """Run MC benchmark eval for every arch in dataset.arch_list."""
-    hf_cache = artifact_dir + "/hf_cache"
+    # Share the same cache as the extract / LM-eval stages (HF_HOME) instead
+    # of a separate artifact_dir-local one — see eval_lm.evaluate_all_families.
+    hf_cache = os.environ.get("HF_HOME", artifact_dir + "/hf_cache")
     results = {}
     for arch in dataset.arch_list:
         results[arch] = evaluate_family_mc(
