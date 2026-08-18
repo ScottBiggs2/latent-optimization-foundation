@@ -129,6 +129,48 @@ def reconstruct_model_blocks(
         reconstruct_block(recon_flat, layer, schema)
 
 
+def generate_model_blocks(
+    model: nn.Module,
+    arch: str,
+    pca: BatchedCovariancePCA,
+    vae: ConditionedBlockVAE,
+    max_block_size: int,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> None:
+    """
+    Replace every transformer block's weights with a fresh sample from the
+    VAE's prior (z ~ N(0, I)), conditioned on block_idx + family_idx — no real
+    block is encoded. Tests the VAE as a generative model over the weight
+    space rather than as an autoencoder. Modifies model in-place.
+    """
+    cfg     = get_arch_config(arch)
+    layers  = get_layers(model, arch)
+    family_idx = int(cfg["family_idx"])
+    vae.eval()
+
+    for i, layer in enumerate(layers):
+        flat, schema = extract_block_flat(layer)
+        n_real = len(flat)
+
+        with torch.no_grad():
+            z       = torch.randn(1, vae.latent_dim, device=device, generator=generator)
+            bidx_t  = torch.tensor([i],          dtype=torch.long, device=device)
+            fidx_t  = torch.tensor([family_idx], dtype=torch.long, device=device)
+            gen_code = vae.decode(z, bidx_t, fidx_t)
+
+        gen_code_np = gen_code.cpu().numpy()
+
+        # Inverse PCA: (1, k) → (1, max_block_size)
+        gen_padded = pca.inverse_transform(gen_code_np).squeeze(0)
+
+        # Strip padding
+        gen_flat = gen_padded[:n_real]
+
+        # Load back into layer
+        reconstruct_block(gen_flat, layer, schema)
+
+
 # ---------------------------------------------------------------------------
 # Per-family evaluation
 # ---------------------------------------------------------------------------

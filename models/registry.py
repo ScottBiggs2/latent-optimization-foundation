@@ -102,12 +102,19 @@ ARCH_CONFIGS: dict[str, dict] = {
 
     # ── Gated models (require HF_TOKEN + HuggingFace access approval) ────────
     "gemma3_270m": {
-        # Gemma 3 (Google) — multimodal; decoder blocks at model.language_model.layers
+        # Gemma 3 (Google) — this checkpoint's config.model_type is the
+        # text-only "gemma3_text" (no text_config/vision_config split), so
+        # AutoModelForCausalLM resolves it to Gemma3ForCausalLM, whose .model
+        # is a Gemma3TextModel with .layers directly — no .language_model hop.
+        # That hop is only real for the multimodal 4B/12B/27B checkpoints
+        # (model_type "gemma3", Gemma3ForConditionalGeneration). Confirmed
+        # against the actual crash trace from job 8553164 (real weight load)
+        # plus transformers 5.9.0 source and public HF config metadata.
         # Access: https://huggingface.co/google/gemma-3-270m
         # To use: set HF_TOKEN in slurm_train.sh and add to arch_list.
         "default_model_id": "google/gemma-3-270m",
-        "hf_model_type":    "gemma3",
-        "layers_attr":      "model.language_model.layers",
+        "hf_model_type":    "gemma3_text",
+        "layers_attr":      "model.layers",
         "family_idx":       4,         # set to 4 when used alongside the default 4
         "tiny_config": dict(
             hidden_size=128,
@@ -210,7 +217,7 @@ N_FAMILIES = len(ARCH_CONFIGS)
 
 # Maximum block index across all architectures (for embedding table sizing)
 MAX_BLOCKS = max(
-    cfg.get("n_layers_hint", 40)        # conservative upper bound
+    cfg.get("n_layers_hint", 36)        # conservative upper bound
     for cfg in ARCH_CONFIGS.values()
 )
 # Actual upper bound: SmolLM2-360M has 32 layers (the tallest of all

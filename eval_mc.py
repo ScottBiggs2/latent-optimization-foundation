@@ -17,16 +17,18 @@ per-benchmark prompt construction.
 from __future__ import annotations
 
 import gc
+import json
 import os
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 from data.block_dataset import BlockDataset
 from data.mc_loader import LOADERS, MCExample
 from dual_pca import BatchedCovariancePCA
-from eval_lm import reconstruct_model_blocks
+from eval_lm import generate_model_blocks, reconstruct_model_blocks
 from models.registry import get_arch_config, load_model
 from vae import ConditionedBlockVAE
 
@@ -159,9 +161,16 @@ def evaluate_family_mc(
     benchmarks: tuple[str, ...] = ("mmlu", "hellaswag", "gpqa"),
     n_questions: int = 200,
     hf_cache: Optional[str] = None,
+    block_transform_fn: Callable = reconstruct_model_blocks,
 ) -> dict:
     """
     Full before/after multiple-choice accuracy evaluation for one family.
+
+    block_transform_fn replaces the model's blocks in-place before the second
+    measurement — pass `reconstruct_model_blocks` (default; VAE round-trips
+    each real block) or `generate_model_blocks` (samples fresh blocks from
+    the VAE's prior instead, testing generative rather than reconstructive
+    quality).
 
     Returns a dict keyed by benchmark name, each holding original/
     reconstructed acc and acc_norm plus their deltas.
@@ -197,8 +206,8 @@ def evaluate_family_mc(
         print(f"  [{arch}] Original {bench}: acc={original[bench]['acc']:.3f}  "
               f"acc_norm={original[bench]['acc_norm']:.3f}")
 
-    print(f"  [{arch}] Reconstructing blocks …")
-    reconstruct_model_blocks(model, arch, pca, vae, max_block_size, device)
+    print(f"  [{arch}] Transforming blocks ({block_transform_fn.__name__}) …")
+    block_transform_fn(model, arch, pca, vae, max_block_size, device)
 
     reconstructed: dict[str, dict] = {}
     for bench, examples in examples_by_bench.items():
@@ -238,18 +247,164 @@ def evaluate_all_families_mc(
     benchmarks: tuple[str, ...] = ("mmlu", "hellaswag", "gpqa"),
     n_questions: int = 200,
     artifact_dir: str = "/scratch/biggs.s/llm_vae",
+    arch_list: Optional[list[str]] = None,
+    block_transform_fn: Callable = reconstruct_model_blocks,
 ) -> dict:
-    """Run MC benchmark eval for every arch in dataset.arch_list."""
+    """Run MC benchmark eval for every arch in arch_list (default: dataset.arch_list)."""
     # Share the same cache as the extract / LM-eval stages (HF_HOME) instead
     # of a separate artifact_dir-local one — see eval_lm.evaluate_all_families.
     hf_cache = os.environ.get("HF_HOME", artifact_dir + "/hf_cache")
     results = {}
-    for arch in dataset.arch_list:
+    for arch in (arch_list or dataset.arch_list):
         results[arch] = evaluate_family_mc(
             arch, pca, vae,
             max_block_size=dataset.max_block_size,
             benchmarks=benchmarks,
             n_questions=n_questions,
             hf_cache=hf_cache,
+            block_transform_fn=block_transform_fn,
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI — hook into either raw HF checkpoints or a trained PCA+VAE
+# ---------------------------------------------------------------------------
+
+def _load_pca_vae_dataset(artifact_dir: str, pca_dir: Optional[str], vae_dir: Optional[str]):
+    """
+    Load a trained PCA + VAE + the BlockDataset they were trained on, straight
+    from train.py's saved artifacts — no re-extraction/re-training needed.
+    Mirrors train.py's own resume path (_load_existing_dataset).
+    """
+    import argparse as _argparse
+    import train as T
+
+    blocks_dir = os.path.join(artifact_dir, "blocks")
+    with open(os.path.join(blocks_dir, "dataset_meta.json")) as f:
+        meta = json.load(f)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pca = BatchedCovariancePCA.load(pca_dir or os.path.join(artifact_dir, "pca"), device=device)
+
+    vdir = vae_dir or os.path.join(artifact_dir, "vae")
+    with open(os.path.join(vdir, "vae_config.json")) as f:
+        vae_cfg = json.load(f)
+    vae = ConditionedBlockVAE(**vae_cfg).to(device)
+    vae.load_state_dict(torch.load(os.path.join(vdir, "vae_best.pt"), map_location=device))
+    vae.eval()
+
+    fake_args = _argparse.Namespace(
+        artifact_dir=artifact_dir, noise_scale=meta["noise_scale"], mode=meta["mode"]
+    )
+    dataset = T._load_existing_dataset(meta, fake_args)
+    return pca, vae, dataset, vdir
+
+
+def main():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Standalone multiple-choice benchmark evaluation. Hooks into "
+                     "either raw HuggingFace checkpoints (--raw, arch_list only — "
+                     "no PCA/VAE needed) or a trained PCA+VAE artifact set (default), "
+                     "in which case it can test the VAE as an autoencoder "
+                     "(--mode reconstruct, default) or as a generator sampling fresh "
+                     "block weights straight from its prior (--mode generate)."
+    )
+    p.add_argument("--artifact_dir", default="/scratch/biggs.s/llm_vae")
+    p.add_argument("--pca_dir", default=None, help="Defaults to <artifact_dir>/pca")
+    p.add_argument("--vae_dir", default=None, help="Defaults to <artifact_dir>/vae")
+    p.add_argument("--arch_list", nargs="+", default=None,
+                    help="Restrict evaluation to these archs. With --raw: any "
+                         "registered arch. Otherwise: must be a subset of the "
+                         "archs the loaded PCA/VAE were trained on.")
+    p.add_argument("--raw", action="store_true",
+                    help="Skip PCA/VAE entirely — evaluate stock HF checkpoints "
+                         "directly (the 'hf model path' hook).")
+    p.add_argument("--mode", choices=["reconstruct", "generate"], default="reconstruct",
+                    help="reconstruct: VAE round-trips each real block (fidelity "
+                         "check). generate: sample fresh blocks from the VAE prior "
+                         "conditioned on block/family (tests generative quality, "
+                         "not just reconstruction). Ignored with --raw.")
+    p.add_argument("--skip_simple_eval", action="store_true",
+                    help="Skip the cheap block-level cosine-sim/MSE pass "
+                         "(evaluate.py) before the expensive MC benchmarks. "
+                         "Automatically skipped for --raw or --mode generate "
+                         "(no matching real block to diff a generated one against).")
+    p.add_argument("--mc_benchmarks", nargs="+", default=["mmlu", "hellaswag", "gpqa"])
+    p.add_argument("--mc_n_questions", type=int, default=200)
+    args = p.parse_args()
+
+    hf_cache = os.environ.get("HF_HOME", os.path.join(args.artifact_dir, "hf_cache"))
+    res_dir = os.path.join(args.artifact_dir, "results")
+    os.makedirs(res_dir, exist_ok=True)
+
+    if args.raw:
+        from eval_baseline import evaluate_baseline_family
+        from models.registry import list_archs
+
+        arch_list = args.arch_list or list_archs()
+        print(f"{'='*60}\nRaw HF checkpoint MC eval — arch_list={arch_list}\n{'='*60}")
+        results = {}
+        for arch in arch_list:
+            print(f"\n=== {arch} ===")
+            results[arch] = evaluate_baseline_family(
+                arch, seq_len=512, n_sequences=32,
+                mc_benchmarks=tuple(args.mc_benchmarks),
+                mc_n_questions=args.mc_n_questions,
+                hf_cache=hf_cache, skip_ppl=True, skip_mc=False,
+            )
+        out_path = os.path.join(res_dir, "mc_eval_raw_results.json")
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nSaved -> {out_path}")
+        return
+
+    pca, vae, dataset, vdir = _load_pca_vae_dataset(args.artifact_dir, args.pca_dir, args.vae_dir)
+
+    mc_arch_list = args.arch_list or dataset.arch_list
+    missing = set(mc_arch_list) - set(dataset.arch_list)
+    if missing:
+        raise ValueError(f"--arch_list contains archs the trained VAE wasn't built "
+                          f"on: {missing}. Available: {dataset.arch_list}")
+
+    if not args.skip_simple_eval and args.mode == "reconstruct":
+        print(f"\n{'='*60}\nStage: block-level reconstruction eval (evaluate.py)\n{'='*60}")
+        from evaluate import evaluate_all
+
+        codes_path = os.path.join(vdir, "pca_codes.npy")
+        codes_np = np.array(np.memmap(codes_path, dtype=np.float32, mode="r",
+                                       shape=(len(dataset), pca.n_components)))
+        codes       = torch.from_numpy(codes_np).float()
+        block_idxs  = torch.from_numpy(dataset._block_idxs).long()
+        family_idxs = torch.from_numpy(dataset._family_idxs).long()
+        device = str(next(vae.parameters()).device)
+
+        simple_results = evaluate_all(pca, vae, dataset, codes, block_idxs, family_idxs, device=device)
+        simple_path = os.path.join(res_dir, "reconstruction_results.json")
+        with open(simple_path, "w") as f:
+            json.dump(simple_results, f, indent=2)
+        print(f"  global cosine_sim = {simple_results['global']['cosine_sim']:.6f}")
+        print(f"  global mse        = {simple_results['global']['mse']:.3e}")
+        print(f"  Saved -> {simple_path}")
+
+    transform_fn = reconstruct_model_blocks if args.mode == "reconstruct" else generate_model_blocks
+    print(f"\n{'='*60}\nStage: MC benchmark eval (mode={args.mode}) — arch_list={mc_arch_list}\n{'='*60}")
+    mc_results = evaluate_all_families_mc(
+        pca, vae, dataset,
+        benchmarks=tuple(args.mc_benchmarks),
+        n_questions=args.mc_n_questions,
+        artifact_dir=args.artifact_dir,
+        arch_list=mc_arch_list,
+        block_transform_fn=transform_fn,
+    )
+    suffix = "" if args.mode == "reconstruct" else "_generated"
+    mc_path = os.path.join(res_dir, f"mc_eval_results{suffix}.json")
+    with open(mc_path, "w") as f:
+        json.dump(mc_results, f, indent=2)
+    print(f"\nSaved -> {mc_path}")
+
+
+if __name__ == "__main__":
+    main()
