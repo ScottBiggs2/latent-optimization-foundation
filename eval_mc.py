@@ -31,6 +31,7 @@ from dual_pca import BatchedCovariancePCA
 from eval_lm import generate_model_blocks, reconstruct_model_blocks
 from models.registry import get_arch_config, load_model
 from vae import ConditionedBlockVAE
+import wandb_utils as wb
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +234,12 @@ def evaluate_family_mc(
             "acc_norm_delta":        recon["acc_norm"] - orig["acc_norm"],
             "n_examples":            orig["n_examples"],
         }
+        wb.log({
+            f"mc/{arch}/{bench}/original_acc": orig["acc"],
+            f"mc/{arch}/{bench}/reconstructed_acc": recon["acc"],
+            f"mc/{arch}/{bench}/acc_delta": results[bench]["acc_delta"],
+            f"mc/{arch}/{bench}/acc_norm_delta": results[bench]["acc_norm_delta"],
+        })
     return results
 
 
@@ -334,11 +341,22 @@ def main():
                          "(no matching real block to diff a generated one against).")
     p.add_argument("--mc_benchmarks", nargs="+", default=["mmlu", "hellaswag", "gpqa"])
     p.add_argument("--mc_n_questions", type=int, default=200)
+    p.add_argument("--no_wandb", action="store_true",
+                    help="Disable Weights & Biases logging for this run")
     args = p.parse_args()
 
     hf_cache = os.environ.get("HF_HOME", os.path.join(args.artifact_dir, "hf_cache"))
     res_dir = os.path.join(args.artifact_dir, "results")
     os.makedirs(res_dir, exist_ok=True)
+
+    job_type = "eval_mc_raw" if args.raw else f"eval_mc_{args.mode}"
+    wb.init_run(
+        job_type=job_type,
+        config=vars(args),
+        tags=[job_type] + (args.arch_list or []),
+        enabled=not args.no_wandb,
+        artifact_dir=args.artifact_dir,
+    )
 
     if args.raw:
         from eval_baseline import evaluate_baseline_family
@@ -359,6 +377,7 @@ def main():
         with open(out_path, "w") as f:
             json.dump(results, f, indent=2)
         print(f"\nSaved -> {out_path}")
+        wb.finish()
         return
 
     pca, vae, dataset, vdir = _load_pca_vae_dataset(args.artifact_dir, args.pca_dir, args.vae_dir)
@@ -388,6 +407,11 @@ def main():
         print(f"  global cosine_sim = {simple_results['global']['cosine_sim']:.6f}")
         print(f"  global mse        = {simple_results['global']['mse']:.3e}")
         print(f"  Saved -> {simple_path}")
+        wb.log({
+            "recon/cosine_sim": simple_results["global"]["cosine_sim"],
+            "recon/mse": simple_results["global"]["mse"],
+            "recon/kl_divergence": simple_results["global"]["kl_divergence"],
+        })
 
     transform_fn = reconstruct_model_blocks if args.mode == "reconstruct" else generate_model_blocks
     print(f"\n{'='*60}\nStage: MC benchmark eval (mode={args.mode}) — arch_list={mc_arch_list}\n{'='*60}")
@@ -404,6 +428,7 @@ def main():
     with open(mc_path, "w") as f:
         json.dump(mc_results, f, indent=2)
     print(f"\nSaved -> {mc_path}")
+    wb.finish()
 
 
 if __name__ == "__main__":

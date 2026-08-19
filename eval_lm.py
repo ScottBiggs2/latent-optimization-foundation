@@ -27,6 +27,7 @@ from dual_pca import BatchedCovariancePCA
 from models.registry import get_arch_config, get_layers, list_archs, load_model, build_tiny_model
 from models.weight_extractor import reconstruct_block, extract_block_flat, pad_block
 from vae import ConditionedBlockVAE
+import wandb_utils as wb
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +244,13 @@ def evaluate_family(
     ppl_delta = reconstructed_ppl - original_ppl
     print(f"  [{arch}] Reconstructed PPL = {reconstructed_ppl:.3f}  "
           f"(Δ = {ppl_delta:+.3f})")
+
+    wb.log({
+        f"lm/{arch}/original_ppl": original_ppl,
+        f"lm/{arch}/reconstructed_ppl": reconstructed_ppl,
+        f"lm/{arch}/ppl_delta": ppl_delta,
+        f"lm/{arch}/ppl_delta_pct": 100.0 * ppl_delta / max(original_ppl, 1e-9),
+    })
 
     del model
     gc.collect()

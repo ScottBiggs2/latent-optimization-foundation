@@ -14,3 +14,6 @@ datasets>=2.14.0
 
 # Progress / display
 tqdm>=4.65.0
+
+# Reporting
+wandb>=0.17.0

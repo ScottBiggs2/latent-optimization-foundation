@@ -91,11 +91,24 @@ def main():
     p.add_argument("--mc_benchmarks",    nargs="+", default=["mmlu", "hellaswag", "gpqa"])
     p.add_argument("--mc_n_questions",   type=int, default=200)
 
+    # Reporting
+    p.add_argument("--no_wandb", action="store_true",
+                    help="Disable Weights & Biases logging for this run")
+
     args = p.parse_args()
 
     # Ensure scratch dirs exist
     for d in [args.artifact_dir, _HPC_HF_CACHE]:
         os.makedirs(d, exist_ok=True)
+
+    import wandb_utils as wb
+    wb.init_run(
+        job_type="pipeline",
+        config=vars(args),
+        tags=[args.mode] + args.arch_list,
+        enabled=not args.no_wandb,
+        artifact_dir=args.artifact_dir,
+    )
 
     print(f"\n{'='*60}")
     print(f"{ts()} LLM-VAE HPC Pipeline")
@@ -145,6 +158,13 @@ def main():
     print(f"  global mse        = {results['global']['mse']:.3e}")
     for arch, fm in results["per_family"].items():
         print(f"  {arch}: cosine_sim={fm['cosine_sim']:.6f}  mse={fm['mse']:.3e}")
+    wb.log({
+        "recon/cosine_sim": results["global"]["cosine_sim"],
+        "recon/mse": results["global"]["mse"],
+        "recon/kl_divergence": results["global"]["kl_divergence"],
+        **{f"recon/{arch}/cosine_sim": fm["cosine_sim"] for arch, fm in results["per_family"].items()},
+        **{f"recon/{arch}/mse": fm["mse"] for arch, fm in results["per_family"].items()},
+    })
 
     if args.eval_lm:
         print(f"\n{ts()} Stage 6: LM perplexity evaluation …")
@@ -189,6 +209,7 @@ def main():
         print(f"  Saved → {mc_path}")
 
     print(f"\n{ts()} All done. Results in {res_dir}")
+    wb.finish()
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ from eval_lm import compute_perplexity
 from eval_mc import compute_mc_accuracy, get_max_context_length
 from data.mc_loader import LOADERS
 from models.registry import get_arch_config, load_model
+import wandb_utils as wb
 
 _HPC_SCRATCH  = "/scratch/biggs.s"
 _HPC_HF_CACHE = os.path.join(_HPC_SCRATCH, "hf_cache")
@@ -83,6 +84,7 @@ def evaluate_baseline_family(
         result["ce_loss"] = ppl_result["ce_loss"]
         result["n_tokens"] = ppl_result["n_tokens"]
         print(f"  [{arch}] PPL = {result['ppl']:.3f}")
+        wb.log({f"baseline/{arch}/ppl": result["ppl"]})
 
     if not skip_mc:
         max_length = get_max_context_length(model)
@@ -94,6 +96,10 @@ def evaluate_baseline_family(
             acc = compute_mc_accuracy(model, tokenizer, examples, device, max_length=max_length)
             result[bench] = acc
             print(f"  [{arch}] {bench}: acc={acc['acc']:.3f}  acc_norm={acc['acc_norm']:.3f}")
+            wb.log({
+                f"baseline/{arch}/{bench}/acc": acc["acc"],
+                f"baseline/{arch}/{bench}/acc_norm": acc["acc_norm"],
+            })
 
     del model
     gc.collect()
@@ -122,7 +128,18 @@ def main():
     p.add_argument("--skip_ppl", action="store_true", default=False)
     p.add_argument("--skip_mc", action="store_true", default=False)
 
+    p.add_argument("--no_wandb", action="store_true",
+                    help="Disable Weights & Biases logging for this run")
+
     args = p.parse_args()
+
+    wb.init_run(
+        job_type="baseline",
+        config=vars(args),
+        tags=["baseline"] + args.arch_list,
+        enabled=not args.no_wandb,
+        artifact_dir=args.artifact_dir,
+    )
 
     # Share the same cache as run_hpc.py / registry.py (HF_HOME, set above)
     # instead of a separate artifact_dir-local one — otherwise gated-model
@@ -153,6 +170,7 @@ def main():
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n{ts()} Saved -> {out_path}")
+    wb.finish()
 
 
 if __name__ == "__main__":

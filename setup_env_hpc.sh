@@ -66,7 +66,8 @@ pip install \
     accelerate \
     huggingface-hub \
     datasets \
-    tqdm
+    tqdm \
+    wandb
 
 echo ""
 echo "=== Environment '$ENV_NAME' ready ==="

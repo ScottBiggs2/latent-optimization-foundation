@@ -31,6 +31,7 @@ from data.block_dataset import BlockDataset
 from dual_pca import BatchedCovariancePCA
 from models.registry import MAX_BLOCKS, N_FAMILIES, list_archs
 from vae import BetaScheduler, ConditionedBlockVAE
+import wandb_utils as wb
 
 
 def ts() -> str:
@@ -328,6 +329,16 @@ def train_vae(
         }
         history.append(row)
 
+        wb_row = {
+            "beta": beta,
+            "lr": optimizer.param_groups[0]["lr"],
+            "patience": patience_count,
+            "train/loss": train_loss, "train/recon": train_recon, "train/kl": train_kl,
+        }
+        if val_loader is not None:
+            wb_row.update({"val/loss": val_loss, "val/recon": val_recon, "val/kl": val_kl})
+        wb.log(wb_row, step=epoch)
+
         if epoch % 50 == 0 or epoch == 1:
             if val_loader is not None:
                 print(f"  epoch {epoch:4d}/{args.epochs}  "
@@ -415,7 +426,19 @@ def main():
     p.add_argument("--eval_seq_len",    type=int, default=512)
     p.add_argument("--eval_n_sequences", type=int, default=16)
 
+    # Reporting
+    p.add_argument("--no_wandb", action="store_true",
+                   help="Disable Weights & Biases logging for this run")
+
     args = p.parse_args()
+
+    wb.init_run(
+        job_type="train",
+        config=vars(args),
+        tags=[args.mode] + args.arch_list,
+        enabled=not args.no_wandb,
+        artifact_dir=args.artifact_dir,
+    )
 
     # Create artifact directories
     pca_dir  = os.path.join(args.artifact_dir, "pca")
@@ -469,6 +492,13 @@ def main():
     print(f"  cosine_sim (global): {results['global']['cosine_sim']:.6f}")
     print(f"  mse        (global): {results['global']['mse']:.3e}")
     print(f"  Saved → {results_path}")
+    wb.log({
+        "recon/cosine_sim": results["global"]["cosine_sim"],
+        "recon/mse": results["global"]["mse"],
+        "recon/kl_divergence": results["global"]["kl_divergence"],
+        **{f"recon/{arch}/cosine_sim": fm["cosine_sim"] for arch, fm in results["per_family"].items()},
+        **{f"recon/{arch}/mse": fm["mse"] for arch, fm in results["per_family"].items()},
+    })
 
     if args.eval_lm:
         print(f"\n{ts()} Stage 6: LM perplexity evaluation …")
@@ -489,6 +519,7 @@ def main():
                   f"(Δ={res['ppl_delta']:+.3f})")
 
     print(f"\n{ts()} Done. All artifacts in {args.artifact_dir}")
+    wb.finish()
 
 
 if __name__ == "__main__":
