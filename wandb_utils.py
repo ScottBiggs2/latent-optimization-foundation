@@ -25,6 +25,13 @@ except ImportError:
 
 PROJECT = "llm-vae"
 
+# wandb.init() silently falls back to the account's server-side "default
+# team" when entity isn't passed explicitly — for this account that's a
+# shared team entity, not the personal one runs should actually land in.
+# Pin it so that ambiguity can't bite again. Override with WANDB_ENTITY if
+# this ever needs to change.
+ENTITY = os.environ.get("WANDB_ENTITY", "scottbiggs2001-northeastern-university")
+
 
 def init_run(
     job_type: str,
@@ -52,6 +59,7 @@ def init_run(
 
     job_id = os.environ.get("SLURM_JOB_ID", "local")
     _wandb.init(
+        entity=ENTITY,
         project=PROJECT,
         name=f"{job_type}_{job_id}",
         job_type=job_type,
