@@ -11,17 +11,18 @@
 #   EVAL_LM=0 sbatch slurm_train.sh    # skip LM eval to save time
 #   MC_EVAL=1 sbatch slurm_train.sh    # also run MMLU/HellaSwag/GPQA eval
 #
-# The default --arch_list (run_hpc.py) now includes gemma3_270m, which is
-# gated: accept terms at huggingface.co/google/gemma-3-270m, then export
-# HF_TOKEN in your shell before submitting — sbatch inherits it automatically:
-#   export HF_TOKEN=hf_...  &&  sbatch slurm_train.sh
-# Do NOT hardcode a token into this file — it's tracked by git.
+# gemma3_270m and opt_350m are commented out of models/registry.py's
+# ARCH_CONFIGS entirely (gating hassle / PCA-pollution, respectively), so a
+# plain default run below touches nothing gated and needs no HF_TOKEN.
 #
-# MC_EVAL requires GPQA access: accept terms at
-# huggingface.co/datasets/Idavidrein/gpqa (same gating pattern, same
-# HF_TOKEN). Training/PCA/VAE stages are checkpointed, so resubmitting with
-# MC_EVAL=1 on an existing artifact_dir skips straight to the new evaluation
-# stage.
+# MC_EVAL=1 is the only thing here that still needs one — it pulls in GPQA
+# (gated dataset): accept terms at huggingface.co/datasets/Idavidrein/gpqa,
+# then export HF_TOKEN in your shell before submitting — sbatch inherits it
+# automatically:
+#   export HF_TOKEN=hf_...  &&  MC_EVAL=1 sbatch slurm_train.sh
+# Do NOT hardcode a token into this file — it's tracked by git.
+# Training/PCA/VAE stages are checkpointed, so resubmitting with MC_EVAL=1 on
+# an existing artifact_dir skips straight to the new evaluation stage.
 
 #SBATCH --job-name=llm_vae_train
 #SBATCH --output=/scratch/biggs.s/llm_vae/slurm_%j.out
@@ -46,13 +47,13 @@ conda activate llm_vae
 
 # All large files go to scratch — never to $HOME
 export HF_HOME=/scratch/biggs.s/hf_cache
-# HF_TOKEN is required for gated models/datasets — gemma3_270m is now in the
-# default --arch_list (run_hpc.py), and the GPQA dataset used by MC_EVAL=1
-# needs it too. Export it in your shell before running sbatch (see header
-# comment above) — fail fast here instead of silently running unauthenticated
-# if it wasn't:
-: "${HF_TOKEN:?HF_TOKEN is not set — export it in your shell before sbatch, see header comment}"
-export HF_TOKEN
+# HF_TOKEN is only needed for MC_EVAL=1 (GPQA is gated) — no default arch
+# is gated anymore. Fail fast here instead of silently running unauthenticated
+# 40 minutes into training only to hit the GPQA download at the eval stage.
+if [ "${MC_EVAL:-0}" != "0" ]; then
+    : "${HF_TOKEN:?MC_EVAL=1 needs GPQA access — export HF_TOKEN in your shell before sbatch, see header comment}"
+    export HF_TOKEN
+fi
 export HF_DATASETS_CACHE=/scratch/biggs.s/hf_cache
 export TRITON_CACHE_DIR=/scratch/biggs.s/triton_cache
 export ARTIFACT_DIR=/scratch/biggs.s/llm_vae

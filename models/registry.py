@@ -100,59 +100,68 @@ ARCH_CONFIGS: dict[str, dict] = {
         ),
     },
 
-    # ── Gated models (require HF_TOKEN + HuggingFace access approval) ────────
-    "gemma3_270m": {
-        # Gemma 3 (Google) — this checkpoint's config.model_type is the
-        # text-only "gemma3_text" (no text_config/vision_config split), so
-        # AutoModelForCausalLM resolves it to Gemma3ForCausalLM, whose .model
-        # is a Gemma3TextModel with .layers directly — no .language_model hop.
-        # That hop is only real for the multimodal 4B/12B/27B checkpoints
-        # (model_type "gemma3", Gemma3ForConditionalGeneration). Confirmed
-        # against the actual crash trace from job 8553164 (real weight load)
-        # plus transformers 5.9.0 source and public HF config metadata.
-        # Access: https://huggingface.co/google/gemma-3-270m
-        # To use: set HF_TOKEN in slurm_train.sh and add to arch_list.
-        "default_model_id": "google/gemma-3-270m",
-        "hf_model_type":    "gemma3_text",
-        "layers_attr":      "model.layers",
-        "family_idx":       4,         # set to 4 when used alongside the default 4
-        "tiny_config": dict(
-            hidden_size=128,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=32,
-            intermediate_size=512,
-            vocab_size=1000,
-            max_position_embeddings=512,
-            rms_norm_eps=1e-6,
-        ),
-    },
-    # Biases included ends up breaking the PCA - remove from arch_list
-    "opt_350m": {
-        # OPTForCausalLM — pre-norm, biases on all projections
-        "default_model_id": "facebook/opt-350m",
-        "hf_model_type":    "opt",
-        # OPT layers live at model.model.decoder.layers
-        "layers_attr":      "model.decoder.layers",
-        "family_idx":       3,
-        "tiny_config": dict(
-            hidden_size=128,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            ffn_dim=512,
-            word_embed_proj_dim=128,
-            vocab_size=1000,
-            max_position_embeddings=512,
-        ),
-    },
+    # ── Disabled — see notes on each entry below. Commented out rather than
+    # deleted since both are otherwise-working registrations we may want back.
+    # family_idx values below were renumbered contiguously (0-5) to match;
+    # if either of these is re-enabled, renumber everything again — N_FAMILIES
+    # sizes the VAE's embedding table, so a gap or out-of-range family_idx
+    # crashes training, it doesn't just silently waste a slot.
+    #
+    # "gemma3_270m": {
+    #     # Gemma 3 (Google) — this checkpoint's config.model_type is the
+    #     # text-only "gemma3_text" (no text_config/vision_config split), so
+    #     # AutoModelForCausalLM resolves it to Gemma3ForCausalLM, whose .model
+    #     # is a Gemma3TextModel with .layers directly — no .language_model hop.
+    #     # That hop is only real for the multimodal 4B/12B/27B checkpoints
+    #     # (model_type "gemma3", Gemma3ForConditionalGeneration). Confirmed
+    #     # against the actual crash trace from job 8553164 (real weight load)
+    #     # plus transformers 5.9.0 source and public HF config metadata.
+    #     # Access: https://huggingface.co/google/gemma-3-270m
+    #     # Disabled: gated, requires a fresh HF_TOKEN export before every
+    #     # sbatch — cut for now to simplify launching. To re-enable: set
+    #     # HF_TOKEN and add back to run_hpc.py's --arch_list.
+    #     "default_model_id": "google/gemma-3-270m",
+    #     "hf_model_type":    "gemma3_text",
+    #     "layers_attr":      "model.layers",
+    #     "family_idx":       4,
+    #     "tiny_config": dict(
+    #         hidden_size=128,
+    #         num_hidden_layers=2,
+    #         num_attention_heads=4,
+    #         num_key_value_heads=2,
+    #         head_dim=32,
+    #         intermediate_size=512,
+    #         vocab_size=1000,
+    #         max_position_embeddings=512,
+    #         rms_norm_eps=1e-6,
+    #     ),
+    # },
+    # "opt_350m": {
+    #     # OPTForCausalLM — pre-norm, biases on all projections.
+    #     # Disabled: biases pollute the shared PCA basis (see README "Known
+    #     # issues") — cosine_sim=0.77 vs. >0.998 for the bias-free archs.
+    #     "default_model_id": "facebook/opt-350m",
+    #     "hf_model_type":    "opt",
+    #     # OPT layers live at model.model.decoder.layers
+    #     "layers_attr":      "model.decoder.layers",
+    #     "family_idx":       3,
+    #     "tiny_config": dict(
+    #         hidden_size=128,
+    #         num_hidden_layers=2,
+    #         num_attention_heads=4,
+    #         ffn_dim=512,
+    #         word_embed_proj_dim=128,
+    #         vocab_size=1000,
+    #         max_position_embeddings=512,
+    #     ),
+    # },
 
     "smollm2_135m": {
         # LlamaForCausalLM — same family as smollm2_360m, narrower hidden dim.
         "default_model_id": "HuggingFaceTB/SmolLM2-135M",
         "hf_model_type":    "llama",
         "layers_attr":      "model.layers",
-        "family_idx":       5,
+        "family_idx":       3,
         # Real config: 30 layers, hidden=576, heads=9, kv_heads=3, ffn=1536
         "tiny_config": dict(
             hidden_size=128,
@@ -168,15 +177,15 @@ ARCH_CONFIGS: dict[str, dict] = {
     },
 
     # Pythia (GPT-NeoX) linear layers carry biases on every projection, same
-    # as OPT — same PCA-pollution risk documented on opt_350m below applies
-    # here too. Added anyway per the "amazing source of checkpoints" note;
-    # keep an eye on their reconstruction quality once trained.
+    # as OPT (disabled above) — same PCA-pollution risk applies here too.
+    # Added anyway per the "amazing source of checkpoints" note; keep an eye
+    # on their reconstruction quality once trained.
     "pythia_160m": {
         # GPTNeoXForCausalLM: blocks live at model.gpt_neox.layers
         "default_model_id": "EleutherAI/pythia-160m",
         "hf_model_type":    "gpt_neox",
         "layers_attr":      "gpt_neox.layers",
-        "family_idx":       6,
+        "family_idx":       4,
         # Real config: 12 layers, hidden=768, heads=12, ffn=3072
         "tiny_config": dict(
             hidden_size=128,
@@ -196,7 +205,7 @@ ARCH_CONFIGS: dict[str, dict] = {
         "default_model_id": "EleutherAI/pythia-410m",
         "hf_model_type":    "gpt_neox",
         "layers_attr":      "gpt_neox.layers",
-        "family_idx":       7,
+        "family_idx":       5,
         # Real config: 24 layers, hidden=1024, heads=16, ffn=4096
         "tiny_config": dict(
             hidden_size=128,
