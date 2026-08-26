@@ -15,6 +15,29 @@
 # ARCH_CONFIGS entirely (gating hassle / PCA-pollution, respectively), so a
 # plain default run below touches nothing gated and needs no HF_TOKEN.
 #
+# Config notes (08/24) — three settings below are deliberate, not defaults:
+#
+#   --val_fraction 0.0   eval_lm reconstructs ALL blocks, so a random-block val
+#                        split puts untrained blocks straight into the PPL table.
+#                        The split also leaks: PCA is fit on every block before
+#                        the split happens. Hold out a whole family or a whole
+#                        checkpoint when the dataset is big enough to afford it.
+#
+#   --free_bits 0.05     The 2026-08-21 run collapsed to 0.001 nats/sample total
+#   --cond_dropout 0.15  KL — the decoder ignored z and reconstructed each block
+#                        from (family_idx, block_idx), which is a unique key over
+#                        the dataset. These two make z carry information again.
+#                        Watch kl/total_nats_per_sample and kl/active_units in
+#                        wandb: below ~0.5 nats total, the latent is still dead
+#                        and no generative machinery on top of it can work.
+#
+#   --exclude_1d         Norm gains and biases stay at their pretrained values
+#                        instead of going through PCA. They are <0.1% of params
+#                        (so ~zero weight under L2) but functionally critical,
+#                        and their distribution drags the shared basis. This is
+#                        the mechanism that got opt_350m dropped; pythia_410m
+#                        carries the same per-projection biases.
+#
 # MC_EVAL=1 is the only thing here that still needs one — it pulls in GPQA
 # (gated dataset): accept terms at huggingface.co/datasets/Idavidrein/gpqa,
 # then export HF_TOKEN in your shell before submitting — sbatch inherits it
@@ -83,19 +106,23 @@ python run_hpc.py \
     --mode "$MODE" \
     --artifact_dir "$ARTIFACT_DIR" \
     --n_components 97 \
-    --pca_batch_size 10 \
+    --pca_batch_size 25 \
+    --exclude_1d \
     --latent_dim 32 \
     --hidden_dim 256 \
     --cond_dim 64 \
     --val_fraction 0.0 \
-    --epochs 500 \
-    --patience 50 \
-    --warmup_epochs 50 \
+    --epochs 5000 \
+    --patience 100 \
+    --warmup_epochs 100 \
     --beta 1.0 \
+    --free_bits 0.05 \
+    --cond_dropout 0.15 \
+    --code_noise_std 0.02 \
     --lr 3e-4 \
-    --batch_size 32 \
-    --eval_seq_len 512 \
-    --eval_n_sequences 32 \
+    --batch_size 64 \
+    --eval_seq_len 1024 \
+    --eval_n_sequences 64 \
     $EVAL_LM_FLAG \
     $MC_EVAL_FLAG
 

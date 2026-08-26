@@ -37,6 +37,13 @@ from models.weight_extractor import (
 )
 
 
+# Bumped whenever the on-disk layout of blocks/ changes shape or meaning.
+# _load_existing_dataset in train.py hard-errors on a mismatch rather than
+# silently resuming from an incompatible artifact set.
+#   1 = padded (N, max_block_size) all_blocks.npy + all_masks.npy, one block per row
+BLOCK_LAYOUT_VERSION = 1
+
+
 class BlockDataset(Dataset):
     """
     Pre-extracts all transformer blocks from all specified model families.
@@ -50,6 +57,9 @@ class BlockDataset(Dataset):
     mode         : 'tiny' (random-init, no download) or 'full' (pretrained)
     artifact_dir : directory for memmap files (full mode) and dataset metadata
     augment      : whether to apply noise augmentation in __getitem__
+    exclude_1d   : omit norm gains and biases from the flat vector (and schema),
+                   so they are never touched by PCA/VAE reconstruction — see
+                   models/weight_extractor.py
     """
 
     def __init__(
@@ -60,6 +70,7 @@ class BlockDataset(Dataset):
         mode: str = "full",
         artifact_dir: str = "/scratch/biggs.s/llm_vae",
         augment: bool = True,
+        exclude_1d: bool = False,
     ):
         if arch_list is None:
             arch_list = list_archs()
@@ -69,6 +80,7 @@ class BlockDataset(Dataset):
         self.mode = mode
         self.artifact_dir = artifact_dir
         self.augment = augment
+        self.exclude_1d = exclude_1d
 
         blocks_dir = os.path.join(artifact_dir, "blocks")
         os.makedirs(blocks_dir, exist_ok=True)
@@ -79,6 +91,7 @@ class BlockDataset(Dataset):
         self._arch_names: List[str] = []
         self._schemas: List[List[ParamEntry]] = []
         self._real_sizes: List[int] = []   # number of real (non-padded) params
+        self._block_stds: List[float] = [] # per-block weight std, for augmentation
 
         # Phase 1: collect real block sizes to determine max_block_size
         all_arch_blocks: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, int]] = {}
@@ -99,16 +112,19 @@ class BlockDataset(Dataset):
             arch_schemas: List[List[ParamEntry]] = []
             arch_real_sizes: List[int] = []
             arch_flats: List[np.ndarray] = []
+            arch_stds: List[float] = []
 
             for layer in layers:
-                flat, schema = extract_block_flat(layer)
+                flat, schema = extract_block_flat(layer, exclude_1d=exclude_1d)
                 arch_schemas.append(schema)
                 arch_real_sizes.append(len(flat))
                 arch_flats.append(flat)
+                arch_stds.append(float(flat.std()) if flat.size else 0.0)
                 if len(flat) > discovered_max:
                     discovered_max = len(flat)
 
-            all_arch_blocks[arch] = (arch_flats, arch_schemas, arch_real_sizes, n_layers)
+            all_arch_blocks[arch] = (arch_flats, arch_schemas, arch_real_sizes,
+                                      n_layers, arch_stds)
 
             # Free the full model immediately
             del model
@@ -131,7 +147,7 @@ class BlockDataset(Dataset):
 
         # Phase 3: allocate storage and fill
         # Determine total number of blocks
-        total_blocks = sum(info[3] for info in all_arch_blocks.values())
+        total_blocks = sum(info[3] for info in all_arch_blocks.values())   # info[3] = n_layers
         print(f"[BlockDataset] Total blocks: {total_blocks}")
 
         if mode == "tiny":
@@ -148,11 +164,12 @@ class BlockDataset(Dataset):
                                      shape=(total_blocks, max_block_size))
 
         row = 0
-        for arch, (arch_flats, arch_schemas, arch_real_sizes, n_layers) in all_arch_blocks.items():
+        for arch, (arch_flats, arch_schemas, arch_real_sizes, n_layers,
+                    arch_stds) in all_arch_blocks.items():
             cfg = get_arch_config(arch)
             family_idx = int(cfg["family_idx"])
-            for i, (flat, schema, real_size) in enumerate(
-                zip(arch_flats, arch_schemas, arch_real_sizes)
+            for i, (flat, schema, real_size, blk_std) in enumerate(
+                zip(arch_flats, arch_schemas, arch_real_sizes, arch_stds)
             ):
                 # Pad and write
                 n = len(flat)
@@ -166,6 +183,7 @@ class BlockDataset(Dataset):
                 self._arch_names.append(arch)
                 self._schemas.append(schema)
                 self._real_sizes.append(real_size)
+                self._block_stds.append(blk_std)
                 row += 1
 
         if mode != "tiny":
@@ -176,17 +194,24 @@ class BlockDataset(Dataset):
         self._block_idxs  = np.array(self._block_idxs,  dtype=np.int64)
         self._family_idxs = np.array(self._family_idxs, dtype=np.int64)
         self._real_sizes  = np.array(self._real_sizes,  dtype=np.int64)
+        self._block_stds  = np.array(self._block_stds,  dtype=np.float32)
 
-        # Save dataset metadata alongside the memmaps
+        # Save dataset metadata alongside the memmaps.  real_sizes/block_stds go
+        # in here too so the resume path (train._load_existing_dataset) can
+        # restore them exactly instead of guessing them from a tiny model.
         meta = {
+            "layout_version": BLOCK_LAYOUT_VERSION,
             "total_blocks": total_blocks,
             "max_block_size": max_block_size,
             "arch_list": arch_list,
             "mode": mode,
             "noise_scale": noise_scale,
+            "exclude_1d": bool(exclude_1d),
             "blocks_per_arch": {
                 arch: int(info[3]) for arch, info in all_arch_blocks.items()
             },
+            "real_sizes":  [int(x) for x in self._real_sizes],
+            "block_stds":  [float(x) for x in self._block_stds],
         }
         meta_path = os.path.join(blocks_dir, "dataset_meta.json")
         with open(meta_path, "w") as f:
@@ -244,6 +269,14 @@ class BlockDataset(Dataset):
     def get_real_size(self, idx: int) -> int:
         """Return the number of non-padded params for block idx."""
         return int(self._real_sizes[idx])
+
+    def get_block_std(self, idx: int) -> float:
+        """Return the std of block idx's real (non-padded) weights."""
+        return float(self._block_stds[idx])
+
+    def block_stds_numpy(self) -> np.ndarray:
+        """Return (N,) float32 per-block weight stds, aligned with block order."""
+        return np.asarray(self._block_stds, dtype=np.float32)
 
     def make_loader(self) -> "Callable":
         """

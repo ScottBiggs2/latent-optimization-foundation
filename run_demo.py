@@ -47,6 +47,11 @@ def main():
     p.add_argument("--lr",            type=float, default=3e-4)
     p.add_argument("--batch_size",    type=int,   default=8)
     p.add_argument("--noise_scale",   type=float, default=1e-7)
+    p.add_argument("--code_noise_std", type=float, default=0.02)
+    p.add_argument("--free_bits",      type=float, default=0.05)
+    p.add_argument("--cond_dropout",   type=float, default=0.15)
+    p.add_argument("--exclude_1d",     action="store_true")
+    p.add_argument("--val_fraction",   type=float, default=0.0)
     p.add_argument("--pca_batch_size",type=int,   default=4)
     p.add_argument("--eval_seq_len",  type=int,   default=64)
     p.add_argument("--eval_n_sequences", type=int, default=4)
@@ -98,7 +103,8 @@ def _run_pipeline(args):
     dataset      = T.stage_extract(args, args.arch_list, blocks_dir)
     pca          = T.stage_pca(args, dataset, pca_dir)
     codes, bidxs, fidxs = T.stage_encode(args, dataset, pca, vae_dir)
-    vae          = T.train_vae(args, codes, bidxs, fidxs, vae_dir)
+    vae          = T.train_vae(args, codes, bidxs, fidxs, vae_dir,
+                                block_stds=dataset.block_stds_numpy())
 
     results = evaluate_all(pca, vae, dataset, codes, bidxs, fidxs,
                            device=str(next(vae.parameters()).device))

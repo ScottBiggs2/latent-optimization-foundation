@@ -27,8 +27,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
-from data.block_dataset import BlockDataset
-from dual_pca import BatchedCovariancePCA
+from data.block_dataset import BLOCK_LAYOUT_VERSION, BlockDataset
+from dual_pca import BatchedCovariancePCA, load_codes
 from models.registry import MAX_BLOCKS, N_FAMILIES, list_archs
 from vae import BetaScheduler, ConditionedBlockVAE
 import wandb_utils as wb
@@ -65,12 +65,29 @@ def stage_extract(
         mode=args.mode,
         artifact_dir=args.artifact_dir,
         augment=True,
+        exclude_1d=getattr(args, "exclude_1d", False),
     )
     return dataset
 
 
 def _load_existing_dataset(meta: dict, args) -> BlockDataset:
     """Re-instantiate BlockDataset from existing memmap files (fast path)."""
+    # Version gate. Every stage in this pipeline is guarded only by
+    # os.path.exists, so an artifact directory left over from a run with a
+    # different layout is resumed rather than rejected. That is not a hypothetical:
+    # the shapes are read from meta and applied to raw memmaps, so a mismatch
+    # produces plausible-looking numbers instead of an error.
+    found = meta.get("layout_version")
+    if found != BLOCK_LAYOUT_VERSION:
+        raise RuntimeError(
+            f"Refusing to resume from {os.path.join(args.artifact_dir, 'blocks')}: "
+            f"dataset_meta.json reports layout_version={found!r}, but this code "
+            f"expects {BLOCK_LAYOUT_VERSION}. "
+            f"{'Artifacts written before 2026-08-25 carry no version field and are '
+               'from the padded six-family block layout.' if found is None else ''} "
+            f"Re-extract with --force_extract, or point --artifact_dir at a fresh "
+            f"directory."
+        )
     dataset = BlockDataset.__new__(BlockDataset)
     blocks_dir = os.path.join(args.artifact_dir, "blocks")
 
@@ -80,6 +97,7 @@ def _load_existing_dataset(meta: dict, args) -> BlockDataset:
     dataset.artifact_dir    = args.artifact_dir
     dataset.augment         = True
     dataset.max_block_size  = meta["max_block_size"]
+    dataset.exclude_1d      = bool(meta.get("exclude_1d", False))
 
     total   = meta["total_blocks"]
     max_sz  = meta["max_block_size"]
@@ -90,37 +108,54 @@ def _load_existing_dataset(meta: dict, args) -> BlockDataset:
         os.path.join(blocks_dir, "all_masks.npy"),
         dtype=np.uint8, mode="r", shape=(total, max_sz))
 
-    # Re-build block extraction is required to get schemas — use tiny approach
-    # for metadata reconstruction or load from a secondary metadata file.
-    # For now: rebuild tiny models just to get schemas (very fast).
+    # Rebuild the per-block metadata lists.
+    #
+    # Schemas: built from TINY models (hidden=128) as a structural template. The
+    # parameter *names* and their order match the real model; the *shapes* do
+    # not. That is fine only because nothing reads these schemas on the resume
+    # path — eval_lm/eval_mc re-extract the schema from the freshly loaded real
+    # model (eval_lm.reconstruct_model_blocks), and evaluate.py only touches
+    # _blocks/_masks. `_real_sizes` and `_block_stds` used to be derived from
+    # those tiny shapes too, which made them silently wrong; they now come from
+    # dataset_meta.json where the extraction stage recorded the real values.
     from models.registry import build_tiny_model, get_arch_config, get_layers
     from models.weight_extractor import extract_block_flat
 
-    block_idxs, family_idxs, arch_names, schemas, real_sizes = [], [], [], [], []
+    exclude_1d = bool(meta.get("exclude_1d", False))
+    block_idxs, family_idxs, arch_names, schemas = [], [], [], []
+    tiny_sizes = []
     for arch in meta["arch_list"]:
-        if meta["mode"] == "tiny":
-            model = build_tiny_model(arch)
-        else:
-            # For schema reconstruction from full models we use the tiny model
-            # as a structural template — parameter names/shapes are the same.
-            model = build_tiny_model(arch)
+        model = build_tiny_model(arch)
         cfg = get_arch_config(arch)
         layers = get_layers(model, arch)
         n_this = meta["blocks_per_arch"][arch]
         for i in range(n_this):
-            flat, schema = extract_block_flat(layers[min(i, len(layers)-1)])
+            flat, schema = extract_block_flat(
+                layers[min(i, len(layers) - 1)], exclude_1d=exclude_1d)
             block_idxs.append(i)
             family_idxs.append(int(cfg["family_idx"]))
             arch_names.append(arch)
             schemas.append(schema)
-            real_sizes.append(len(flat))
+            tiny_sizes.append(len(flat))
         del model; gc.collect()
 
     dataset._block_idxs  = np.array(block_idxs,  dtype=np.int64)
     dataset._family_idxs = np.array(family_idxs, dtype=np.int64)
     dataset._arch_names  = arch_names
     dataset._schemas     = schemas
-    dataset._real_sizes  = np.array(real_sizes, dtype=np.int64)
+
+    # Prefer the recorded real values; fall back to the tiny-model sizes only for
+    # datasets extracted before those fields were written, and say so loudly.
+    if "real_sizes" in meta and "block_stds" in meta:
+        dataset._real_sizes = np.array(meta["real_sizes"], dtype=np.int64)
+        dataset._block_stds = np.array(meta["block_stds"], dtype=np.float32)
+    else:
+        print("  WARNING: dataset_meta.json predates real_sizes/block_stds. "
+              "Falling back to tiny-model parameter counts, which are WRONG for "
+              "full mode. Re-extract with --force_extract if anything reads "
+              "get_real_size()/get_block_std().")
+        dataset._real_sizes = np.array(tiny_sizes, dtype=np.int64)
+        dataset._block_stds = np.zeros(len(tiny_sizes), dtype=np.float32)
     return dataset
 
 
@@ -138,6 +173,11 @@ def stage_pca(args, dataset: BlockDataset, pca_dir: str) -> BatchedCovariancePCA
 
     N = len(dataset)
     n_comp = min(args.n_components, N - 1)
+    if n_comp != args.n_components:
+        print(f"  --n_components={args.n_components} capped to {n_comp} (= N_blocks - 1). "
+              f"At n_comp = N-1 the basis spans the entire affine hull of the "
+              f"training blocks, so projection is lossless in-sample and any "
+              f"decoded sample is confined to that hull.")
     loader = dataset.make_loader()   # creates one in-memory copy of all blocks
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -156,10 +196,10 @@ def stage_encode(
 
     if os.path.exists(codes_path) and not args.force_encode:
         print(f"{ts()} Found existing PCA codes at {codes_path} — loading …")
-        # pca_codes.npy is a raw memmap binary (no .npy header), not a pickle.
-        N_cached = len(dataset)
-        codes_np = np.array(np.memmap(codes_path, dtype=np.float32, mode="r",
-                                      shape=(N_cached, pca.n_components)))
+        # load_codes validates the shape instead of silently reinterpreting a stale
+        # file — see dual_pca.load_codes for why that mattered.
+        codes_np = load_codes(codes_path, n_models=len(dataset),
+                              n_components=pca.n_components)
     else:
         print(f"{ts()} Stage 3: Encoding {len(dataset)} blocks → PCA codes …")
         N = len(dataset)
@@ -169,8 +209,8 @@ def stage_encode(
         codes_file = os.path.join(vae_dir, "pca_codes.npy")
         pca.transform(loader, n_models=N, batch_size=args.pca_batch_size,
                       output_file=codes_file)
-        codes_np = np.array(np.memmap(codes_file, dtype=np.float32, mode="r",
-                                      shape=(N, pca.n_components)))
+        codes_np = load_codes(codes_file, n_models=N,
+                              n_components=pca.n_components)
         gc.collect()
 
     codes      = torch.from_numpy(codes_np).float()
@@ -190,8 +230,14 @@ def train_vae(
     block_idxs: torch.Tensor,
     family_idxs: torch.Tensor,
     vae_dir: str,
+    block_stds: "np.ndarray | None" = None,
 ) -> ConditionedBlockVAE:
-    """Train ConditionedBlockVAE on PCA codes."""
+    """
+    Train ConditionedBlockVAE on PCA codes.
+
+    block_stds : optional (N,) per-block weight std, used to scale the
+                 `--noise_scale` augmentation. Pass dataset.block_stds_numpy().
+    """
     vae_path   = os.path.join(vae_dir, "vae_best.pt")
     cfg_path   = os.path.join(vae_dir, "vae_config.json")
     metrics_path = os.path.join(vae_dir, "train_metrics.json")
@@ -200,14 +246,21 @@ def train_vae(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"{ts()} Stage 4: Training VAE on {N} blocks, code_dim={k}, device={device}")
 
-    # Compute per-dimension normalization stats from the full code matrix.
-    # Stored as VAE buffers so they travel with the checkpoint and are
-    # available to evaluation code without a separate file.
-    code_mean = codes.mean(dim=0)
-    code_std  = codes.std(dim=0).clamp(min=1e-8)
+    # Normalization stats from the full code matrix. Stored as VAE buffers so
+    # they travel with the checkpoint and are available to evaluation code
+    # without a separate file. set_code_norm() reduces the std to a single
+    # scalar on purpose — see the vae.py module docstring.
+    code_mean   = codes.mean(dim=0)
+    code_std    = codes.std(dim=0).clamp(min=1e-8)
+    per_dim_std = code_std                      # kept for the noise augmentation
     print(f"  Code scale: mean_abs={code_mean.abs().mean():.2f}, "
-          f"std_mean={code_std.mean():.2f}  "
-          f"(ELBO loss computed in normalized space)")
+          f"per-dim std {code_std.max():.2f} (PC 0) → {code_std.min():.2f} (PC {k-1}), "
+          f"ratio {float(code_std.max() / code_std.min()):.2f}x")
+    print(f"  ELBO uses a single global scale ({float(code_std.pow(2).mean().sqrt()):.2f}) "
+          f"so relative PC magnitudes survive into the loss.")
+
+    cond_dropout_p = getattr(args, "cond_dropout", 0.15)
+    free_bits      = getattr(args, "free_bits", 0.05)
 
     model = ConditionedBlockVAE(
         code_dim=k,
@@ -216,6 +269,7 @@ def train_vae(
         cond_dim=args.cond_dim,
         max_blocks=MAX_BLOCKS,
         n_families=N_FAMILIES,
+        cond_dropout_p=cond_dropout_p,
     ).to(device)
 
     cfg_dict = {
@@ -225,6 +279,7 @@ def train_vae(
         "cond_dim": args.cond_dim,
         "max_blocks": MAX_BLOCKS,
         "n_families": N_FAMILIES,
+        "cond_dropout_p": cond_dropout_p,
     }
     with open(cfg_path, "w") as f:
         json.dump(cfg_dict, f, indent=2)
@@ -237,7 +292,10 @@ def train_vae(
     # exploration: we care about reconstruction fidelity on known weights, not
     # generalization to unseen architectures.  Use train-loss plateau stopping.
     val_fraction = getattr(args, "val_fraction", 0.0)
-    full_ds = TensorDataset(codes, block_idxs, family_idxs)
+    # row_idx rides along so the augmentation can look up each block's own weight
+    # std; random_split shuffles rows, so positional indexing is not enough.
+    row_idx = torch.arange(N, dtype=torch.long)
+    full_ds = TensorDataset(codes, block_idxs, family_idxs, row_idx)
 
     if val_fraction <= 0.0:
         train_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=True)
@@ -264,40 +322,96 @@ def train_vae(
     patience_count = 0
     history: list[dict] = []
 
+    # Augmentation noise, applied to the PCA codes each batch.
+    #
+    # The old weight-space path in BlockDataset.__getitem__ never ran: PCA reads
+    # blocks via make_loader() and the VAE trains on precomputed codes, so
+    # nothing called __getitem__. Doing it in code space instead is justified by
+    # linearity: the components V are unit-norm and orthogonal, so isotropic
+    # weight-space noise eps ~ N(0, s^2 I_D) projects to V eps ~ N(0, s^2 I_k) —
+    # isotropic with the SAME std. That equivalence is exact only when the block
+    # occupies the whole padded vector; for a padded block the true noise lives in
+    # a d < D subspace and V_real V_real^T is a scaled projection rather than the
+    # identity, so this slightly overstates the magnitude there. With the 350-400M
+    # roster padding is 0% / 22% / 0%, so the gap is small. Revisit if a
+    # heavily-padded family comes back.
+    #
+    # `--noise_scale` keeps its original meaning (std relative to the block's own
+    # weight std). `--code_noise_std` is the same idea expressed relative to the
+    # per-PC code std, which is the scale that actually bites here — the old 1e-7
+    # weight-relative default sits ~9 orders of magnitude below the code scale,
+    # i.e. it was a no-op even before the dead-code bug.
+    noise_scale     = float(getattr(args, "noise_scale", 0.0) or 0.0)
+    code_noise_std  = float(getattr(args, "code_noise_std", 0.0) or 0.0)
+    block_std_t = None
+    if noise_scale > 0.0 and block_stds is not None:
+        block_std_t = torch.as_tensor(block_stds, dtype=torch.float32, device=device)
+    per_dim_std_t = per_dim_std.to(device)
+    augment_on = (noise_scale > 0.0 and block_std_t is not None) or code_noise_std > 0.0
+    if augment_on:
+        print(f"  Code-space augmentation: noise_scale={noise_scale:g} "
+              f"(weight-relative), code_noise_std={code_noise_std:g} (PC-relative)")
+    else:
+        print("  Code-space augmentation: OFF")
+
     for epoch in range(1, args.epochs + 1):
         beta = beta_scheduler.get(epoch)
 
         # ---- train ----
         model.train()
         train_loss = train_recon = train_kl = 0.0
-        for codes_b, bidx_b, fidx_b in train_loader:
+        kl_dims_sum = torch.zeros(args.latent_dim, device=device)
+        for codes_b, bidx_b, fidx_b, row_b in train_loader:
             codes_b = codes_b.to(device)
             bidx_b  = bidx_b.to(device)
             fidx_b  = fidx_b.to(device)
+
+            if augment_on:
+                noise = torch.zeros_like(codes_b)
+                if code_noise_std > 0.0:
+                    noise += torch.randn_like(codes_b) * (code_noise_std * per_dim_std_t)
+                if block_std_t is not None:
+                    sig = (noise_scale * block_std_t[row_b.to(device)]).unsqueeze(1)
+                    noise += torch.randn_like(codes_b) * sig
+                codes_in = codes_b + noise
+            else:
+                codes_in = codes_b
+
             optimizer.zero_grad()
-            recon, mu, logvar = model(codes_b, bidx_b, fidx_b)
-            loss, rl, kl = model.elbo_loss(recon, codes_b, mu, logvar, beta=beta)
+            recon, mu, logvar = model(codes_in, bidx_b, fidx_b)
+            # Reconstruct toward the CLEAN codes — the noise is input-side
+            # augmentation, not a target perturbation.
+            loss, rl, kl = model.elbo_loss(recon, codes_b, mu, logvar,
+                                            beta=beta, free_bits=free_bits)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_loss  += loss.item()
             train_recon += rl.item()
             train_kl    += kl.item()
-        train_loss  /= len(train_loader)
-        train_recon /= len(train_loader)
-        train_kl    /= len(train_loader)
+            with torch.no_grad():
+                kl_dims_sum += model.kl_per_dim(mu, logvar)
+        n_batches = len(train_loader)
+        train_loss  /= n_batches
+        train_recon /= n_batches
+        train_kl    /= n_batches
+        kl_dims = (kl_dims_sum / n_batches).detach()
+        kl_total_nats = float(kl_dims.sum())
+        active_units  = int((kl_dims > 0.01).sum())
 
         # ---- val (optional) ----
         model.eval()
         if val_loader is not None:
             val_loss = val_recon = val_kl = 0.0
             with torch.no_grad():
-                for codes_b, bidx_b, fidx_b in val_loader:
+                for codes_b, bidx_b, fidx_b, _row_b in val_loader:
                     codes_b = codes_b.to(device)
                     bidx_b  = bidx_b.to(device)
                     fidx_b  = fidx_b.to(device)
-                    recon, mu, logvar = model(codes_b, bidx_b, fidx_b)
-                    loss, rl, kl = model.elbo_loss(recon, codes_b, mu, logvar, beta=beta)
+                    # sample=True keeps the val ELBO the same objective as train.
+                    recon, mu, logvar = model(codes_b, bidx_b, fidx_b, sample=True)
+                    loss, rl, kl = model.elbo_loss(recon, codes_b, mu, logvar,
+                                                    beta=beta, free_bits=free_bits)
                     val_loss  += loss.item()
                     val_recon += rl.item()
                     val_kl    += kl.item()
@@ -312,7 +426,15 @@ def train_vae(
 
         scheduler.step(monitor_loss)
 
-        if monitor_loss < best_val_loss:
+        # Early stopping and best-checkpoint selection only start once beta has
+        # reached its final value. During warmup the objective itself changes
+        # every epoch, so comparing monitor_loss across epochs compares different
+        # functions — beta ramping in pushes the loss UP while reconstruction is
+        # still improving, which previously let the patience counter fill up
+        # during warmup and stop the run before it had really started.
+        in_warmup = epoch <= args.warmup_epochs
+
+        if monitor_loss < best_val_loss or in_warmup:
             best_val_loss = monitor_loss
             torch.save(model.state_dict(), vae_path)
             patience_count = 0
@@ -323,6 +445,8 @@ def train_vae(
             "epoch": epoch, "beta": round(beta, 4),
             "train_loss": round(train_loss, 6), "train_recon": round(train_recon, 6),
             "train_kl": round(train_kl, 6),
+            "kl_total_nats": round(kl_total_nats, 6),
+            "active_units": active_units,
             "val_loss": round(val_loss, 6) if not (val_loss != val_loss) else None,
             "val_recon": round(val_recon, 6) if not (val_recon != val_recon) else None,
             "val_kl": round(val_kl, 6) if not (val_kl != val_kl) else None,
@@ -334,31 +458,60 @@ def train_vae(
             "lr": optimizer.param_groups[0]["lr"],
             "patience": patience_count,
             "train/loss": train_loss, "train/recon": train_recon, "train/kl": train_kl,
+            # The collapse diagnostics. train/kl alone cannot distinguish a
+            # healthy latent from a dead one; these two can.
+            "kl/total_nats_per_sample": kl_total_nats,
+            "kl/active_units": active_units,
+            "kl/max_dim_nats": float(kl_dims.max()),
         }
         if val_loader is not None:
             wb_row.update({"val/loss": val_loss, "val/recon": val_recon, "val/kl": val_kl})
         wb.log(wb_row, step=epoch)
 
         if epoch % 50 == 0 or epoch == 1:
+            head = (f"  epoch {epoch:4d}/{args.epochs}  train={train_loss:.5f}  ")
             if val_loader is not None:
-                print(f"  epoch {epoch:4d}/{args.epochs}  "
-                      f"train={train_loss:.5f}  val={val_loss:.5f}  "
-                      f"recon={val_recon:.5f}  kl={val_kl:.5f}  beta={beta:.3f}  "
-                      f"patience={patience_count}/{args.patience}")
+                head += f"val={val_loss:.5f}  recon={val_recon:.5f}  "
             else:
-                print(f"  epoch {epoch:4d}/{args.epochs}  "
-                      f"train={train_loss:.5f}  recon={train_recon:.5f}  "
-                      f"kl={train_kl:.5f}  beta={beta:.3f}  "
-                      f"patience={patience_count}/{args.patience}")
+                head += f"recon={train_recon:.5f}  "
+            print(head +
+                  f"kl={train_kl:.6f}  KL={kl_total_nats:.3f}nats  "
+                  f"active={active_units}/{args.latent_dim}  beta={beta:.3f}  "
+                  f"patience={patience_count}/{args.patience}"
+                  f"{'  [warmup]' if in_warmup else ''}")
 
         if patience_count >= args.patience:
             label = "val" if val_loader is not None else "train"
             print(f"  Early stopping at epoch {epoch} (best {label}={best_val_loss:.6f})")
             break
 
+    kl_dims_final = [round(float(x), 6) for x in kl_dims.cpu()]
     with open(metrics_path, "w") as f:
-        json.dump({"best_monitor_loss": best_val_loss, "history": history}, f, indent=2)
+        json.dump({
+            "best_monitor_loss": best_val_loss,
+            "final_kl_total_nats": kl_total_nats,
+            "final_active_units": active_units,
+            "final_kl_per_dim": kl_dims_final,
+            "cond_dropout_p": cond_dropout_p,
+            "free_bits": free_bits,
+            "history": history,
+        }, f, indent=2)
     print(f"{ts()} VAE training done — best loss={best_val_loss:.6f}")
+    # Collapse check. An absolute threshold is misleading once free_bits is on,
+    # because free_bits alone guarantees a KL of free_bits * latent_dim nats even
+    # when every dimension is pinned at the floor and carries no information. So
+    # compare against the floor, not against a constant.
+    kl_floor = free_bits * args.latent_dim
+    print(f"  Final KL: {kl_total_nats:.4f} nats/sample across "
+          f"{active_units}/{args.latent_dim} active dims"
+          f"{f' (free-bits floor: {kl_floor:.3f})' if kl_floor > 0 else ''}")
+    if kl_total_nats <= max(0.5, 1.10 * kl_floor):
+        print(f"  WARNING: KL ({kl_total_nats:.4f} nats) is at or near the "
+              f"free-bits floor ({kl_floor:.3f}) — every latent dim is pinned at "
+              f"the floor, so the latent is carrying no real information and the "
+              f"decoder is reconstructing from its conditioning alone. Raise "
+              f"--cond_dropout, or lower --beta. Generative machinery built on "
+              f"this latent cannot work.")
     print(f"  Checkpoint → {vae_path}")
 
     # Load best weights
@@ -380,7 +533,17 @@ def main():
     p.add_argument("--mode", choices=["tiny", "full"], default="full",
                    help="'tiny'=random-init local test; 'full'=pretrained")
     p.add_argument("--noise_scale", type=float, default=1e-7,
-                   help="Augmentation noise std relative to block std (≤1e-6)")
+                   help="Augmentation noise std relative to each block's weight "
+                        "std. Applied to PCA codes (exact by PCA linearity — see "
+                        "train_vae). NOTE 1e-7 is ~9 orders of magnitude below the "
+                        "code scale, i.e. effectively off; use --code_noise_std.")
+    p.add_argument("--code_noise_std", type=float, default=0.02,
+                   help="Augmentation noise std relative to each PCA dimension's "
+                        "own std. This is the knob that actually bites at this "
+                        "dataset size. 0 disables.")
+    p.add_argument("--exclude_1d", action="store_true",
+                   help="Exclude 1-D params (norm gains, biases) from the PCA/VAE. "
+                        "They keep their pretrained values on reconstruction.")
 
     # PCA
     p.add_argument("--n_components", type=int, default=97,
@@ -402,6 +565,15 @@ def main():
     p.add_argument("--warmup_epochs",  type=int,   default=50,
                    help="Epochs to linearly ramp beta from 0 → beta")
     p.add_argument("--beta",           type=float, default=1.0)
+    p.add_argument("--free_bits",       type=float, default=0.05,
+                   help="Per-latent-dim KL floor in nats. Dims below the floor "
+                        "incur no penalty, so beta cannot crush them to zero. "
+                        "0.05 x latent_dim is the resulting KL floor.")
+    p.add_argument("--cond_dropout",    type=float, default=0.15,
+                   help="Probability of replacing the conditioning vector with the "
+                        "learned null embedding during training. Stops the decoder "
+                        "using (family_idx, block_idx) as a lookup key, and gives "
+                        "classifier-free guidance its unconditional branch.")
     p.add_argument("--lr",             type=float, default=3e-4)
     p.add_argument("--batch_size",     type=int,   default=32)
 
@@ -479,7 +651,8 @@ def main():
         vae.load_state_dict(torch.load(vae_path, map_location=device))
         vae.eval()
     else:
-        vae = train_vae(args, codes, block_idxs, family_idxs, vae_dir)
+        vae = train_vae(args, codes, block_idxs, family_idxs, vae_dir,
+                        block_stds=dataset.block_stds_numpy())
 
     # ---- Stage 5: Evaluate ----
     print(f"\n{ts()} Stage 5: Evaluating block reconstruction …")

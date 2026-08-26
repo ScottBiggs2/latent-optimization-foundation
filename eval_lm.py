@@ -16,7 +16,7 @@ from __future__ import annotations
 import gc
 import math
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -89,10 +89,16 @@ def reconstruct_model_blocks(
     vae: ConditionedBlockVAE,
     max_block_size: int,
     device: torch.device,
+    exclude_1d: bool = False,
 ) -> None:
     """
     Replace every transformer block's weights with their VAE reconstruction.
     Modifies model in-place.
+
+    exclude_1d MUST match what the PCA was fit on (dataset.exclude_1d), otherwise
+    the flat vectors are laid out differently and the codes are meaningless. When
+    True, norm gains and biases are absent from the schema and so keep their
+    pretrained values.
     """
     cfg     = get_arch_config(arch)
     layers  = get_layers(model, arch)
@@ -100,7 +106,7 @@ def reconstruct_model_blocks(
     vae.eval()
 
     for i, layer in enumerate(layers):
-        flat, schema = extract_block_flat(layer)
+        flat, schema = extract_block_flat(layer, exclude_1d=exclude_1d)
         n_real = len(flat)
 
         # Pad to max_block_size
@@ -116,7 +122,11 @@ def reconstruct_model_blocks(
             code_t  = torch.from_numpy(code).float().to(device)
             bidx_t  = torch.tensor([i],          dtype=torch.long, device=device)
             fidx_t  = torch.tensor([family_idx], dtype=torch.long, device=device)
-            recon_code, _, _ = vae(code_t, bidx_t, fidx_t)
+            # sample=False -> use the posterior mean. Reconstruction fidelity is
+            # a deterministic measurement; sampling would add noise to it. This
+            # used to happen implicitly because reparameterize() returned mu
+            # inside any no_grad block.
+            recon_code, _, _ = vae(code_t, bidx_t, fidx_t, sample=False)
 
         recon_code_np = recon_code.cpu().numpy()
 
@@ -137,28 +147,46 @@ def generate_model_blocks(
     vae: ConditionedBlockVAE,
     max_block_size: int,
     device: torch.device,
+    exclude_1d: bool = False,
     generator: Optional[torch.Generator] = None,
+    guidance_scale: float = 1.0,
+    latent_sampler: Optional[Callable] = None,
 ) -> None:
     """
     Replace every transformer block's weights with a fresh sample from the
     VAE's prior (z ~ N(0, I)), conditioned on block_idx + family_idx — no real
     block is encoded. Tests the VAE as a generative model over the weight
     space rather than as an autoencoder. Modifies model in-place.
+
+    latent_sampler : optional Callable(block_idx, family_idx, n_layers, device,
+                     generator) -> (1, latent_dim) tensor. This is the seam a
+                     flow-matching or Gaussian latent model plugs into; the
+                     default draws from N(0, I). Keeping it a parameter means the
+                     PCA-inverse and write-back path below is never duplicated.
+    guidance_scale : classifier-free guidance strength (1.0 = plain conditional).
+                     Requires a VAE trained with cond_dropout_p > 0.
     """
     cfg     = get_arch_config(arch)
     layers  = get_layers(model, arch)
     family_idx = int(cfg["family_idx"])
+    n_layers = len(layers)
     vae.eval()
 
     for i, layer in enumerate(layers):
-        flat, schema = extract_block_flat(layer)
+        flat, schema = extract_block_flat(layer, exclude_1d=exclude_1d)
         n_real = len(flat)
 
         with torch.no_grad():
-            z       = torch.randn(1, vae.latent_dim, device=device, generator=generator)
             bidx_t  = torch.tensor([i],          dtype=torch.long, device=device)
             fidx_t  = torch.tensor([family_idx], dtype=torch.long, device=device)
-            gen_code = vae.decode(z, bidx_t, fidx_t)
+            if latent_sampler is not None:
+                z = latent_sampler(block_idx=i, family_idx=family_idx,
+                                    n_layers=n_layers, device=device,
+                                    generator=generator).to(device)
+            else:
+                z = torch.randn(1, vae.latent_dim, device=device, generator=generator)
+            gen_code = vae.decode_cfg(z, bidx_t, fidx_t,
+                                       guidance_scale=guidance_scale)
 
         gen_code_np = gen_code.cpu().numpy()
 
@@ -185,6 +213,7 @@ def evaluate_family(
     seq_len: int = 512,
     n_sequences: int = 16,
     hf_cache: Optional[str] = None,
+    exclude_1d: bool = False,
 ) -> dict:
     """
     Full before/after PPL evaluation for one model family.
@@ -235,7 +264,8 @@ def evaluate_family(
 
     # Reconstruct all blocks
     print(f"  [{arch}] Reconstructing blocks …")
-    reconstruct_model_blocks(model, arch, pca, vae, max_block_size, device)
+    reconstruct_model_blocks(model, arch, pca, vae, max_block_size, device,
+                             exclude_1d=exclude_1d)
 
     # Measure reconstructed PPL
     print(f"  [{arch}] Measuring reconstructed PPL …")
@@ -296,5 +326,6 @@ def evaluate_all_families(
             seq_len=seq_len,
             n_sequences=n_sequences,
             hf_cache=hf_cache,
+            exclude_1d=getattr(dataset, "exclude_1d", False),
         )
     return results

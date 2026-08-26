@@ -45,7 +45,8 @@ def evaluate_block(
         code_t     = torch.from_numpy(original_code).float().unsqueeze(0).to(dev)
         bidx_t     = torch.tensor([block_idx],  dtype=torch.long, device=dev)
         fidx_t     = torch.tensor([family_idx], dtype=torch.long, device=dev)
-        recon_code, mu, logvar = vae(code_t, bidx_t, fidx_t)
+        # sample=False -> posterior mean, so this metric is deterministic.
+        recon_code, mu, logvar = vae(code_t, bidx_t, fidx_t, sample=False)
 
     recon_code_np = recon_code.squeeze(0).cpu().numpy()
 

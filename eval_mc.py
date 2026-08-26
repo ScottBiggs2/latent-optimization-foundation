@@ -27,7 +27,7 @@ import torch.nn as nn
 
 from data.block_dataset import BlockDataset
 from data.mc_loader import LOADERS, MCExample
-from dual_pca import BatchedCovariancePCA
+from dual_pca import BatchedCovariancePCA, load_codes
 from eval_lm import generate_model_blocks, reconstruct_model_blocks
 from models.registry import get_arch_config, load_model
 from vae import ConditionedBlockVAE
@@ -163,6 +163,7 @@ def evaluate_family_mc(
     n_questions: int = 200,
     hf_cache: Optional[str] = None,
     block_transform_fn: Callable = reconstruct_model_blocks,
+    exclude_1d: bool = False,
 ) -> dict:
     """
     Full before/after multiple-choice accuracy evaluation for one family.
@@ -207,8 +208,10 @@ def evaluate_family_mc(
         print(f"  [{arch}] Original {bench}: acc={original[bench]['acc']:.3f}  "
               f"acc_norm={original[bench]['acc_norm']:.3f}")
 
-    print(f"  [{arch}] Transforming blocks ({block_transform_fn.__name__}) …")
-    block_transform_fn(model, arch, pca, vae, max_block_size, device)
+    print(f"  [{arch}] Transforming blocks ({block_transform_fn.__name__}, "
+          f"exclude_1d={exclude_1d}) …")
+    block_transform_fn(model, arch, pca, vae, max_block_size, device,
+                       exclude_1d=exclude_1d)
 
     reconstructed: dict[str, dict] = {}
     for bench, examples in examples_by_bench.items():
@@ -270,6 +273,7 @@ def evaluate_all_families_mc(
             n_questions=n_questions,
             hf_cache=hf_cache,
             block_transform_fn=block_transform_fn,
+            exclude_1d=getattr(dataset, "exclude_1d", False),
         )
     return results
 
@@ -393,8 +397,8 @@ def main():
         from evaluate import evaluate_all
 
         codes_path = os.path.join(vdir, "pca_codes.npy")
-        codes_np = np.array(np.memmap(codes_path, dtype=np.float32, mode="r",
-                                       shape=(len(dataset), pca.n_components)))
+        codes_np = load_codes(codes_path, n_models=len(dataset),
+                              n_components=pca.n_components)
         codes       = torch.from_numpy(codes_np).float()
         block_idxs  = torch.from_numpy(dataset._block_idxs).long()
         family_idxs = torch.from_numpy(dataset._family_idxs).long()

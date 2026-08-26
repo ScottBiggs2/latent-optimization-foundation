@@ -6,9 +6,24 @@ architecture-specific name lists. This gives a consistent, depth-first
 parameter ordering that is stable for a given architecture and requires
 no config changes when new architectures are added.
 
+1-D parameter exclusion (`exclude_1d`)
+--------------------------------------
+LayerNorm/RMSNorm gains and projection biases are 1-D tensors.  They are <0.1%
+of a block's parameter count, so an L2 objective over the flat vector gives them
+almost no weight — yet they are functionally critical, and their value
+distribution is nothing like a weight matrix's, which drags the shared PCA basis
+in unhelpful directions.  That mechanism is why opt_350m was dropped from the
+default arch_list (see README "Known issues"); pythia_160m/pythia_410m carry the
+same per-projection biases.
+
+With exclude_1d=True, parameters with ndim < 2 are left out of the flat vector
+AND out of the returned schema.  Because reconstruct_block() only writes the
+parameters named in the schema, those tensors are simply never touched — they
+keep whatever the freshly-loaded pretrained model had.  No side storage needed.
+
 Public API
 ----------
-  extract_block_flat(block)          → (flat_float32, schema)
+  extract_block_flat(block, exclude_1d=False)  → (flat_float32, schema)
   compute_max_block_size(archs)      → int
   pad_block(flat, target_size)       → (padded, mask)
   extract_all_blocks(model, arch, max_block_size)
@@ -43,12 +58,19 @@ class ParamEntry(NamedTuple):
 
 def extract_block_flat(
     block: nn.Module,
+    exclude_1d: bool = False,
 ) -> Tuple[np.ndarray, List[ParamEntry]]:
     """
-    Flatten all parameters in one transformer decoder block.
+    Flatten the parameters of one transformer decoder block.
 
     Uses block.named_parameters() which returns parameters in PyTorch's
     canonical registration order (depth-first, consistent across calls).
+
+    Parameters
+    ----------
+    exclude_1d : skip parameters with ndim < 2 (norm gains, biases). They are
+                 omitted from both the flat vector and the schema, so
+                 reconstruct_block() leaves them untouched — see module docstring.
 
     Returns
     -------
@@ -58,14 +80,17 @@ def extract_block_flat(
     schema: List[ParamEntry] = []
     parts: List[np.ndarray] = []
     for name, param in block.named_parameters():
+        if exclude_1d and param.dim() < 2:
+            continue
         schema.append(ParamEntry(name, tuple(param.shape)))
         parts.append(param.detach().cpu().float().numpy().ravel())
     flat = np.concatenate(parts) if parts else np.array([], dtype=np.float32)
     return flat, schema
 
 
-def count_block_params(block: nn.Module) -> int:
-    return sum(p.numel() for p in block.parameters())
+def count_block_params(block: nn.Module, exclude_1d: bool = False) -> int:
+    return sum(p.numel() for p in block.parameters()
+               if not (exclude_1d and p.dim() < 2))
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +126,7 @@ def pad_block(
 # Max block size discovery
 # ---------------------------------------------------------------------------
 
-def compute_max_block_size(arch_list: List[str]) -> int:
+def compute_max_block_size(arch_list: List[str], exclude_1d: bool = False) -> int:
     """
     Load tiny random-init versions of each architecture and return the
     maximum number of parameters found in any single transformer block.
@@ -116,7 +141,7 @@ def compute_max_block_size(arch_list: List[str]) -> int:
         model = build_tiny_model(arch)
         layers = get_layers(model, arch)
         for layer in layers:
-            size = count_block_params(layer)
+            size = count_block_params(layer, exclude_1d=exclude_1d)
             if size > max_size:
                 max_size = size
         del model
@@ -131,6 +156,7 @@ def extract_all_blocks(
     model: nn.Module,
     arch: str,
     max_block_size: int,
+    exclude_1d: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Extract and pad all transformer blocks from one model.
@@ -156,7 +182,7 @@ def extract_all_blocks(
     masks  = np.zeros((n_layers, max_block_size), dtype=np.uint8)
 
     for i, layer in enumerate(layers):
-        flat, _schema = extract_block_flat(layer)
+        flat, _schema = extract_block_flat(layer, exclude_1d=exclude_1d)
         padded, mask = pad_block(flat, max_block_size)
         blocks[i] = padded
         masks[i]  = mask
