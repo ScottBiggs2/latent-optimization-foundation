@@ -51,36 +51,16 @@ def main():
     # To solve - add qwen 2.5 0.5B, IBM Granite 400M, Baguettotron ~300M,
     # The idea is to try to force pad the range better. But maybe best is actually to focus small first and go from there? 
     
-    # The plan (08/23): refocus to smaller models to verify behavior and get systems working, then scale.
-
-    # The plan (08/24): tight 350-400M band, three DIFFERENT families, so scale is
-    # controlled while architectural diversity is kept. gpt2_medium 355M (GPT-2),
-    # smollm2_360m 360M (LLaMA), pythia_410m 410M (GPT-NeoX). This also makes the
-    # zero-padding nearly uniform — block sizes are 12.60M / 9.83M / 12.60M, so
-    # max_block_size=12.60M and only smollm2_360m pads (~22%). The previous
-    # 135M-355M roster forced smollm2_135m to ~72% padding, and the padding
-    # pattern correlates perfectly with family, which pollutes the shared basis.
-    #
-    # 80 blocks total (24 + 32 + 24) -> n_components caps at 79.
+    # The plan (08/23): refocus to smaller models to verify behavior and get systems working, then scale.  
 
     # _DEFAULT_ARCHS = ["gpt2_medium", "smollm2_360m", "qwen3_0_6b",
     #                    "smollm2_135m", "pythia_160m", "pythia_410m"]
-    # _DEFAULT_ARCHS = ["gpt2_medium", "smollm2_135m", "pythia_160m"]
 
-    _DEFAULT_ARCHS = ["gpt2_medium", "smollm2_360m", "pythia_410m"]
+    _DEFAULT_ARCHS = ["gpt2_medium", "pythia_410m", "smollm2_360m"]
 
     p.add_argument("--arch_list",  nargs="+", default=_DEFAULT_ARCHS)
     p.add_argument("--mode",       choices=["tiny", "full"], default="full")
-    p.add_argument("--noise_scale", type=float, default=1e-7,
-                   help="Augmentation noise std relative to each block's weight std, "
-                        "applied to PCA codes (exact by PCA linearity). 1e-7 is "
-                        "effectively off — use --code_noise_std.")
-    p.add_argument("--code_noise_std", type=float, default=0.02,
-                   help="Augmentation noise std relative to each PCA dimension's own "
-                        "std. 0 disables.")
-    p.add_argument("--exclude_1d", action="store_true",
-                   help="Exclude 1-D params (norm gains, biases) from PCA/VAE; they "
-                        "keep their pretrained values on reconstruction.")
+    p.add_argument("--noise_scale", type=float, default=1e-7)
 
     # PCA
     p.add_argument("--n_components",  type=int, default=97)
@@ -96,13 +76,6 @@ def main():
     p.add_argument("--patience",      type=int,   default=50)
     p.add_argument("--warmup_epochs", type=int,   default=50)
     p.add_argument("--beta",          type=float, default=1.0)
-    p.add_argument("--free_bits",     type=float, default=0.05,
-                   help="Per-latent-dim KL floor in nats — stops beta crushing the "
-                        "latent to zero (the 2026-08-21 run hit 0.001 nats total).")
-    p.add_argument("--cond_dropout",  type=float, default=0.15,
-                   help="Probability of blanking the conditioning vector during "
-                        "training. Stops the decoder using (family_idx, block_idx) "
-                        "as a lookup key; also the CFG null branch.")
     p.add_argument("--lr",            type=float, default=3e-4)
     p.add_argument("--batch_size",    type=int,   default=32)
 
@@ -175,15 +148,14 @@ def main():
 
     print(f"\n{ts()} Stage 2: Fitting PCA …")
     pca = T.stage_pca(args, dataset, pca_dir)
-    print(f"{ts()} Stage 2 complete: {pca.n_components}/{len(dataset) - 1} components, "
-          f"{np.sum(pca.explained_variance_ratio_):.4%} of total variance retained")
+    print(f"{ts()} Stage 2 complete: {pca.n_components} components, "
+          f"{np.sum(pca.explained_variance_ratio_):.4%} variance")
 
     print(f"\n{ts()} Stage 3: Encoding blocks …")
     codes, bidxs, fidxs = T.stage_encode(args, dataset, pca, vae_dir)
 
     print(f"\n{ts()} Stage 4: Training VAE …")
-    vae = T.train_vae(args, codes, bidxs, fidxs, vae_dir,
-                      block_stds=dataset.block_stds_numpy())
+    vae = T.train_vae(args, codes, bidxs, fidxs, vae_dir)
 
     print(f"\n{ts()} Stage 5: Evaluating reconstruction …")
     device = str(next(vae.parameters()).device)

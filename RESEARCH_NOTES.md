@@ -4,6 +4,8 @@ This file has one job. It stops the next agent from repeating work that already
 happened, and from repeating mistakes that already happened.
 
 Written 2026-08-26, after the whole-stack pipeline landed and ran.
+Awarded Scott's Stamp of Tampering and Approval, 2026-08-26
+
 
 ---
 
@@ -46,21 +48,18 @@ The pipeline has never been asked a research question. See section 3.
 
 ---
 
-## 3. The core problem: the ensemble is not real
+## 3. Small Sample Sizes
 
-DeepWeightFlow uses about 100 **independently trained** networks per task. This repo
-has exactly one pretrained model per family. The ensemble is therefore manufactured:
+This repo has exactly one pretrained model per family. This is in contrast to DeepWeightFlow, which uses about 100 **independently trained** networks per task. The ensemble is therefore manufactured with Gaussian noise, as shown below:
 
 ```
 member 0        = w_0                        (the real model, exactly)
 member 1..N-1   = w_0 + s * sigma * eps_i    (isotropic noise)
 ```
 
-Three consequences follow, and all three make the current results uninformative about
-weight space.
+Three consequences follow:
 
-1. **The basis spans injected noise.** The principal directions describe the
-   perturbation, not anything about trained weights.
+1. **The basis spans injected noise.** The principal directions describe the perturbation, which obscures the trained weights.
 2. **The mean is the real model.** `mean = w_0 + O(s*sigma/sqrt(N))`. So
    `x_hat ~= mean ~= w_0` at any rank. Reconstruction of member 0 cannot fail.
 3. **Truncation acts as a denoiser.** Discarding half the variance discards half the
@@ -68,31 +67,13 @@ weight space.
    than the member. Measured: `pythia_410m` recovers exactly half the noise-induced
    perplexity penalty at `k = N/2`.
 
-Point 3 is worth restating. On this ensemble, reconstruction fidelity and model
-quality are **anti-correlated** at low rank. A rank sweep therefore measures the
-augmentation, not the model.
+Point 3 indicates that a rank sweep on `k` could be quite interesting, and contextualize findings in LS-Merge as well as providing a avenue for illuminating the conseuqences of this construction. 
 
-### Permutation augmentation does not fix this
+## 3. Next experiments
 
-Do not reach for permutation augmentation. It is the wrong direction:
+### Experiment 1 — Pythia checkpoint revisions 
 
-- Permuted copies of a network are **functionally identical** to the original.
-- A generative model trained on them regenerates the same network.
-- DeepWeightFlow's TransFusion exists to **remove** permutation variance so a flow can
-  see genuine seed-to-seed variation. Generating permuted copies adds back exactly
-  what TransFusion removes.
-
-Permutation augmentation is a good sanity harness. Generated networks should score
-identically to the original. It is not a source of structure.
-
----
-
-## 4. Next experiments
-
-### Experiment 1 — Pythia checkpoint revisions (do this first)
-
-**Question.** Do complete models from one training run share low-dimensional
-structure in weight space?
+**Question.** Do complete models from one training run share low-dimensional structure in weight space? *Obviously this is true for near-terminal checkpoints.*
 
 **Why this ensemble.** EleutherAI publishes about 143 intermediate revisions per
 Pythia size. Every revision is a genuine complete model. Model scale is fixed. No
@@ -136,7 +117,7 @@ data supports. If the warning fires, lower `k` rather than lowering `rank_rtol`.
 
 ### Experiment 2 — Held-out revision
 
-**Question.** Does the basis generalize to a checkpoint it never saw?
+**Question.** Does the basis generalize to a checkpoint it never saw? *Again, this should be the case for near-terminal checkpoints.*
 
 **Method.** Fit on revisions 0 to 119. Project revision 130 with
 `DualGramPCA.transform_vector`. Reconstruct. Measure ΔPPL.
@@ -151,30 +132,23 @@ measured in-sample reconstruction. `transform_vector` already exists and is test
 **Do not start this until Experiment 1 shows a steep spectrum.** A flow over codes
 whose aggregate distribution is already Gaussian learns the prior and adds nothing.
 
-**Run the cheap baseline first.** Fit a full-covariance Gaussian to the codes, per
-family. Sample it. Push the samples through `DualGramPCA.inverse_transform`. Measure
-ΔPPL. That is about 20 lines. If a Gaussian matches a flow, the flow is not earning
-its complexity.
-
-**If you do build it.** Rectified flow, conditional-OT path. Velocity field
-`v(z_t, t, family, step)` as a 3 to 4 layer MLP with a sinusoidal time embedding.
-About 50 Euler steps at sampling time. On 99-dimensional codes it trains in seconds.
+**Just Build Flows** Rectified flow, conditional-OT path. Velocity field
+`v(z_t, t, family, step)` as a 3 to 4 layer MLP with a sinusoidal time embedding. About 50 Euler steps at sampling time. On 99-dimensional codes it trains in seconds.
 
 `eval_stack.py` already has the seam: the `generate` arm decodes a latent and writes
 the result back. Replace the sampler, keep everything else.
 
+The reasoning is simply that they aren't that expensive or challenging to implement, and if they do not work, then the problem is upstream. See *DeepWeightFlow* for a reference here. 
+
 **Judge samples on ΔPPL.** Do not judge them on code-space or weight-space L2. See
 misstep 9.
 
-### Experiment 4 — Cross-family transfer (currently foreclosed)
+### Experiment 4 — Cross-family transfer 
 
 Per-family PCA gives each family its own basis. Code dimension 0 of `gpt2_medium` and
-code dimension 0 of `pythia_410m` are coefficients on unrelated directions. So
-`family_emb` now means "which decoder to use", not "where in a shared space".
+code dimension 0 of `pythia_410m` are coefficients on unrelated directions. To address this we could either use a VAE as a first pass, or just let the Flows figure it out. 
 
-This forecloses generating weights for a family the model never saw. If cross-family
-transfer is a research goal, it needs a different design, not a parameter change.
-Decide this explicitly before building on top of per-family bases.
+This design choice makes it difficult -- **but maybe not impossible** to explore transfer to unseen model families. The mechanism for this exploration would be to anneal the novel family class into being through CFG inside the flow system (this is a hunch, I do not have citations supporting this, but I believe it is possible). We may want to use CFG anyways, so it is worth a try with relatively little overhead. This does not answer the PCA decoding question, but we could use the VAE to map the novel family into the PCA space of the known families, and then decode from there? Again, all highly speculative.
 
 ---
 
@@ -315,15 +289,8 @@ directory from a different layout gets resumed instead of rejected. Add a
 
 ## 7. Open questions
 
-1. Is a steep spectrum across Pythia revisions real, or do checkpoints drift into
-   near-orthogonal directions? Experiment 1 answers this. Nothing else should be built
-   until it does.
-2. Should `D` include the embedding matrix and the LM head? The repo models decoder
-   blocks only. DeepWeightFlow flattens whole networks. `gpt2_medium`'s embedding is
-   51M parameters, about 17% of its stack.
-3. Is cross-family transfer a goal? Per-family PCA forecloses it. See Experiment 4.
-4. Does the VAE earn its place? At `k = N-1` the PCA is already exact, so the VAE only
-   adds error. Its value has to come from producing a smooth, well-conditioned latent
-   for a generative model. That claim is untested.
-5. Is 32 latent dimensions right for 99-dimensional codes? The VAE currently
-   compresses 99 to 32. Nobody has swept this.
+1. Is a steep spectrum across Pythia revisions real, or do checkpoints drift into near-orthogonal directions? Experiment 1 answers this. Nothing else should be built until it does. Scott: This obviously must be the caase for near-terminal checkpoints, by the same reasoning that PEFT literature follows. The reason I am slow to accept using checkpoints as data is because I am concerned that they are too far from the terminal state to be high-quality LLM weights. 
+2. Should `D` include the embedding matrix and the LM head? The repo models decoder blocks only. DeepWeightFlow flattens whole networks. `gpt2_medium`'s embedding is 51M parameters, about 17% of its stack. Scott: Yes, absolutely it should. 
+3. Is cross-family transfer a goal? Per-family PCA forecloses it. See Experiment 4. Scott: Fuck yeah it is, that would be sick dude.
+4. Does the VAE earn its place? At `k = N-1` the PCA is already exact, so the VAE only adds error. Its value has to come from producing a smooth, well-conditioned latent for a generative model. That claim is untested. Scott: We'll see, but let's keep the machinery intact so we can investigate relations with LS-Merge. It might be needed to regularize and condition the PCA codes for smoother flows. 
+5. Is 32 latent dimensions right for 99-dimensional codes? The VAE currently compresses 99 to 32. Nobody has swept this. Scott: Meh, it's probably fine. We can check it later. 
