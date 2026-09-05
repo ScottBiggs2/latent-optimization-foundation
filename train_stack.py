@@ -29,9 +29,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from artifact_io import (
+    ensemble_fingerprint, pca_fingerprint, provenance_block, read_json,
+)
 from data.ensemble_dataset import EnsembleDataset
 from dual_gram_pca import DualGramPCA
 from models.registry import N_FAMILIES
+from run_bundle import CodeStats, rebuild_manifest
 from vae import BetaScheduler, StackVAE
 import wandb_utils as wb
 
@@ -43,6 +47,43 @@ def ts() -> str:
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
+
+def spectrum_stats(evals: np.ndarray, k: int) -> dict:
+    """
+    Flatness of the retained spectrum, measured three ways.
+
+    `ev0_over_evlast` is the ratio this repo reported first, and on its own it
+    MISLEADS at k = N-1. Measured on a pure-noise ensemble (N=12): 12.09 at k=N-1 but
+    1.006 at k=N/2, for the same data. At the rank bound `ev[k-1]` is the smallest
+    numerically-marginal direction left standing after the rank floor, so the ratio
+    describes the tail rather than the bulk and reads "steep" for an ensemble that is
+    flat by construction. Same trap as `total_variance_captured` being vacuous at
+    k = N-1 (misstep 15).
+
+    So two bulk statistics are recorded alongside it, and they are what anything
+    downstream should gate on:
+
+    ev0_over_median
+        The leading direction's variance as a multiple of the TYPICAL direction's.
+        ~1 for isotropic noise, large when a few directions carry the energy.
+
+    effective_rank_ratio
+        (sum ev)^2 / (sum ev^2) / k -- the participation ratio, normalised to [0, 1].
+        1.0 means every retained direction carries equal variance (perfectly flat);
+        small means the variance is concentrated. Unlike any ratio of two individual
+        eigenvalues, this cannot be moved by one marginal direction at the tail.
+    """
+    ev = np.asarray(evals, dtype=np.float64)[:max(int(k), 1)]
+    ev = np.clip(ev, 1e-300, None)
+    med = float(np.median(ev))
+    eff = float((ev.sum() ** 2) / max(float((ev ** 2).sum()), 1e-300))
+    return {
+        "ev0_over_evlast": float(ev[0] / ev[-1]),
+        "ev0_over_median": float(ev[0] / max(med, 1e-300)),
+        "effective_rank_ratio": eff / max(len(ev), 1),
+        "effective_rank": eff,
+    }
+
 
 def stage_pca(args, ds: EnsembleDataset, pca_root: str) -> Dict[str, DualGramPCA]:
     """Fit (or load) one DualGramPCA per architecture at the maximum rank."""
@@ -58,6 +99,15 @@ def stage_pca(args, ds: EnsembleDataset, pca_root: str) -> Dict[str, DualGramPCA
                 raise RuntimeError(
                     f"{arch}: cached PCA was fit on N={pca.n_samples_} but the "
                     f"ensemble now has N={ds.n_samples}. Re-fit with --force_pca.")
+            # D changes whenever the stack layout changes -- most sharply when the
+            # extra segment is switched on or off. Without this check a stale
+            # decoder-only basis is silently reused against a wider ensemble and
+            # every code means something different.
+            if pca.n_params_ != ds.stacks[arch].n_params:
+                raise RuntimeError(
+                    f"{arch}: cached PCA was fit on D={pca.n_params_:,} but the "
+                    f"ensemble now has D={ds.stacks[arch].n_params:,} "
+                    f"(include_extra={ds.include_extra}). Re-fit with --force_pca.")
         else:
             print(f"\n{ts()} Fitting PCA for {arch} at k={k_max} …")
             pca = DualGramPCA(n_components=k_max).fit(ds, arch)
@@ -66,11 +116,18 @@ def stage_pca(args, ds: EnsembleDataset, pca_root: str) -> Dict[str, DualGramPCA
     return out
 
 
-def stage_codes(ds: EnsembleDataset, pcas: Dict[str, DualGramPCA], k: int):
+def stage_codes(ds: EnsembleDataset, pcas: Dict[str, DualGramPCA], k: int,
+                codes_dir: str, provenance: dict):
     """
-    Assemble the code matrix at rank k, plus family labels and per-family stats.
+    Assemble the code matrix at rank k and SEAL it as an artifact.
 
-    Returns (codes (M,k), family_idxs (M,), arch_of_row list, means (F,k), stds (F,))
+    Returns (codes (M,k) tensor, family_idxs (M,) tensor, arch_of_row, CodeStats).
+
+    Writing codes_k<k>/ is what lets train_flow.py train on 40 KB without ever
+    constructing an EnsembleDataset or touching DualGramPCA. That is the property
+    that makes the flow stack re-runnable on a different ensemble source (Pythia
+    checkpoint revisions): swap the source, re-run stages 1-3, and the flow trainer
+    is unchanged and unaware.
     """
     avail = min(p.n_components for p in pcas.values())
     if k > avail:
@@ -78,25 +135,44 @@ def stage_codes(ds: EnsembleDataset, pcas: Dict[str, DualGramPCA], k: int):
                          f"Re-fit with a larger ensemble, or lower --k.")
 
     blocks, fidxs, arch_of_row = [], [], []
-    means = torch.zeros(N_FAMILIES, k)
-    stds = torch.ones(N_FAMILIES)
+    seen: Dict[int, str] = {}
+    arch_to_family: Dict[str, int] = {}
     for arch in ds.arch_list:
         c = torch.from_numpy(pcas[arch].codes(k).copy()).float()
-        fi = ds.stacks[arch].family_idx
+        fi = int(ds.stacks[arch].family_idx)
+        # Two archs sharing a family_idx would silently overwrite each other's
+        # statistics. Unreachable with today's registry, but the failure is silent,
+        # so it is checked rather than assumed.
+        if fi in seen:
+            raise ValueError(
+                f"{arch} and {seen[fi]} both claim family_idx={fi}. Per-family code "
+                f"statistics are keyed by family_idx, so one would clobber the "
+                f"other. Renumber ARCH_CONFIGS contiguously.")
+        seen[fi] = arch
+        arch_to_family[arch] = fi
         blocks.append(c)
         fidxs.append(torch.full((c.shape[0],), fi, dtype=torch.long))
         arch_of_row.extend([arch] * c.shape[0])
-        # Per-family stats: each family has its OWN basis, so pooling these across
-        # families would be comparing coefficients on unrelated directions.
-        means[fi] = c.mean(dim=0)
-        stds[fi] = c.std(dim=0).clamp(min=1e-8).pow(2).mean().sqrt()
-        print(f"  {arch:16s} codes {tuple(c.shape)}  family_idx={fi}  "
-              f"scale={float(stds[fi]):.4g}")
-    return (torch.cat(blocks), torch.cat(fidxs), arch_of_row, means, stds)
+
+    codes = torch.cat(blocks)
+    fidx = torch.cat(fidxs)
+
+    # CodeStats.from_codes is the single implementation of the reduction: per-dim
+    # mean, and one scalar scale per family (RMS over dimensions of the per-dim
+    # stds). Each family has its OWN basis, so pooling across families would compare
+    # coefficients on unrelated directions.
+    cs = CodeStats.from_codes(codes.numpy(), fidx.numpy(), arch_to_family,
+                              N_FAMILIES, k=k)
+    for arch, fi in arch_to_family.items():
+        print(f"  {arch:16s} codes ({int((fidx == fi).sum())}, {k})  "
+              f"family_idx={fi}  scale={float(cs.stds[fi, 0]):.4g}")
+    cs.save(codes_dir, provenance=provenance)
+    return codes, fidx, arch_of_row, cs
 
 
 def train_vae(args, codes: torch.Tensor, fidxs: torch.Tensor,
-              means: torch.Tensor, stds: torch.Tensor, vae_dir: str) -> StackVAE:
+              code_stats: CodeStats, vae_dir: str,
+              provenance: dict) -> StackVAE:
     os.makedirs(vae_dir, exist_ok=True)
     M, k = codes.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -106,13 +182,14 @@ def train_vae(args, codes: torch.Tensor, fidxs: torch.Tensor,
                      hidden_dim=args.hidden_dim, cond_dim=args.cond_dim,
                      n_families=N_FAMILIES,
                      cond_dropout_p=args.cond_dropout).to(device)
-    model.set_code_norm(means.to(device), stds.to(device))
+    model.set_code_norm(code_stats.torch_means(device),
+                        code_stats.torch_stds(device))
 
-    cfg = {"code_dim": k, "latent_dim": args.latent_dim,
-           "hidden_dim": args.hidden_dim, "cond_dim": args.cond_dim,
-           "n_families": N_FAMILIES, "cond_dropout_p": args.cond_dropout}
+    # vae_config.json is still written, for anything that reads the old layout.
+    # vae_meta.json + vae_weights.pt (sealed at the end of this function) are the
+    # authoritative artifact.
     with open(os.path.join(vae_dir, "vae_config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(model.config(), f, indent=2)
 
     loader = DataLoader(TensorDataset(codes, fidxs),
                         batch_size=args.batch_size, shuffle=True)
@@ -170,11 +247,18 @@ def train_vae(args, codes: torch.Tensor, fidxs: torch.Tensor,
                         "loss": round(tot, 6), "recon": round(rec, 6),
                         "kl": round(klv, 8), "kl_total_nats": round(kl_nats, 6),
                         "active_units": active})
-        wb.log({"beta": beta, "lr": opt.param_groups[0]["lr"],
-                "train/loss": tot, "train/recon": rec, "train/kl": klv,
+        # Namespaced under vae/ so the flow trainer's loss curves can live in the
+        # same project without either one shadowing "train/loss". The two gating
+        # metrics from RESEARCH_NOTES -- total KL nats and active units -- keep
+        # their own kl/ namespace so existing dashboards still resolve.
+        wb.log({"vae/beta": beta, "vae/lr": opt.param_groups[0]["lr"],
+                "vae/train/loss": tot, "vae/train/recon": rec,
+                "vae/train/kl_per_dim": klv,
+                "vae/epoch": epoch,
                 "kl/total_nats_per_sample": kl_nats,
                 "kl/active_units": active,
-                "kl/max_dim_nats": float(kl_dims.max())}, step=epoch)
+                "kl/max_dim_nats": float(kl_dims.max()),
+                "kl/min_dim_nats": float(kl_dims.min())}, step=epoch)
 
         if epoch % 50 == 0 or epoch == 1:
             print(f"  epoch {epoch:5d}/{args.epochs}  loss={tot:.6f}  "
@@ -195,6 +279,17 @@ def train_vae(args, codes: torch.Tensor, fidxs: torch.Tensor,
               "a sample), so treat it as a real signal that something is wrong "
               "rather than as expected collapse.")
 
+    # Terminal values into the run summary so the W&B runs table shows the two
+    # gating numbers as columns, without having to open each run.
+    wb.summary({"vae/best_loss": best,
+                "vae/final_kl_total_nats": kl_nats,
+                "vae/final_active_units": active,
+                "vae/latent_dim": args.latent_dim,
+                "vae/code_dim": k,
+                "vae/epochs_run": epoch,
+                "vae/kl_at_free_bits_floor":
+                    bool(kl_nats <= max(0.5, 1.10 * kl_floor))})
+
     with open(os.path.join(vae_dir, "train_metrics.json"), "w") as f:
         json.dump({"best_loss": best, "final_kl_total_nats": kl_nats,
                    "final_active_units": active,
@@ -205,6 +300,17 @@ def train_vae(args, codes: torch.Tensor, fidxs: torch.Tensor,
 
     model.load_state_dict(torch.load(vae_path, map_location=device))
     model.eval()
+
+    # Seal ONCE, after the best weights are back in the model. vae_best.pt is
+    # rewritten on every improving epoch and stays raw scratch; rewriting the
+    # metadata JSON alongside it up to `epochs` times would buy nothing.
+    model.save(vae_dir, provenance=provenance,
+               code_stats_fingerprint=code_stats.fingerprint(),
+               code_stats_dir=f"codes_k{k}",
+               train={"best_loss": best, "final_kl_total_nats": kl_nats,
+                      "final_active_units": active, "epochs_run": epoch,
+                      "free_bits": args.free_bits,
+                      "cond_dropout_p": args.cond_dropout})
     return model
 
 
@@ -225,6 +331,16 @@ def main() -> None:
                    help="Augmentation std as a fraction of the stack's weight std. "
                         "Calibrate with calibrate_noise.py — too small and the Gram "
                         "matrix is roundoff, too large and the members are broken.")
+    p.add_argument("--include_extra", action="store_true", default=True,
+                   help="Include embeddings, final norm and untied LM head in the "
+                        "stack. On by default: DeepWeightFlow flattens whole "
+                        "networks, and gpt2_medium's embedding alone is ~17%% of "
+                        "its parameters.")
+    p.add_argument("--no_include_extra", dest="include_extra",
+                   action="store_false",
+                   help="Decoder blocks only — the layout_version 1 behaviour. "
+                        "Needs a fresh --run_name; the ensemble cache gate refuses "
+                        "to mix the two.")
     p.add_argument("--exclude_1d", action="store_true", default=True)
     p.add_argument("--no_exclude_1d", dest="exclude_1d", action="store_false")
     p.add_argument("--seed", type=int, default=42)
@@ -260,9 +376,13 @@ def main() -> None:
     k = args.k if args.k is not None else args.n_samples - 1
     vae_dir = os.path.join(run_root, f"vae_k{k}")
 
+    # name_suffix matters: slurm_stack_run.sh calls this script once per rank in a
+    # single job, and each call is its own process, so without it both runs land
+    # under the identical name train_stack_<jobid>.
     wb.init_run(job_type="train_stack", config=vars(args),
-                tags=[args.mode, f"k{k}"] + args.arch_list,
-                enabled=not args.no_wandb, artifact_dir=args.artifact_dir)
+                tags=[args.mode, f"k{k}", args.run_name] + args.arch_list,
+                enabled=not args.no_wandb, artifact_dir=args.artifact_dir,
+                name_suffix=f"{args.run_name}_k{k}")
 
     print("=" * 68)
     print("Whole-stack pipeline (per-family Gram PCA + StackVAE)")
@@ -270,11 +390,14 @@ def main() -> None:
     print(f"  archs     : {args.arch_list}")
     print(f"  N         : {args.n_samples}   noise_scale={args.noise_scale}")
     print(f"  k         : {k}  (rank bound is N-1 = {args.n_samples - 1})")
+    print(f"  extra seg : include_extra={args.include_extra} "
+          f"(embeddings / final norm / untied LM head)")
     print("=" * 68)
 
     print(f"\n{ts()} Stage 1: ensembles")
     ds = EnsembleDataset(arch_list=args.arch_list, n_samples=args.n_samples,
                          noise_scale=args.noise_scale, exclude_1d=args.exclude_1d,
+                         include_extra=args.include_extra,
                          mode=args.mode, artifact_dir=run_root, seed=args.seed,
                          chunk_budget_bytes=args.chunk_budget_mb * 1024 * 1024,
                          force_extract=args.force_extract)
@@ -283,35 +406,91 @@ def main() -> None:
     print(f"\n{ts()} Stage 2: per-family Gram PCA")
     pcas = stage_pca(args, ds, pca_root)
 
+    # Fingerprints bind every downstream artifact to the ensemble and bases it came
+    # from, so a stale codes/VAE/flow directory is DETECTED rather than reused.
+    ens_meta = read_json(os.path.join(run_root, "ensemble", "ensemble_meta.json"))
+    ens_fp = ensemble_fingerprint(ens_meta)
+    pca_fps = {
+        a: pca_fingerprint(
+            read_json(os.path.join(pca_root, a, "gram_pca_meta.json")) or {})
+        for a in args.arch_list
+    }
+    print(f"  ensemble fingerprint : {ens_fp}")
+
     print(f"\n{ts()} Stage 3: codes at k={k}")
-    codes, fidxs, arch_of_row, means, stds = stage_codes(ds, pcas, k)
+    codes_dir = os.path.join(run_root, f"codes_k{k}")
+    codes, fidxs, arch_of_row, code_stats = stage_codes(
+        ds, pcas, k, codes_dir,
+        provenance_block(args.run_name, k, ens_fp, pca_fps))
     print(f"  code matrix: {tuple(codes.shape)} across {len(set(arch_of_row))} families")
 
-    vae = train_vae(args, codes, fidxs, means, stds, vae_dir)
+    vae = train_vae(
+        args, codes, fidxs, code_stats, vae_dir,
+        provenance_block(args.run_name, k, ens_fp, pca_fps,
+                         code_stats_fp=code_stats.fingerprint()))
 
     summary = {
         "run_name": args.run_name, "k": k, "n_samples": args.n_samples,
         "noise_scale": args.noise_scale, "arch_list": args.arch_list,
         "exclude_1d": args.exclude_1d,
+        "include_extra": args.include_extra,
         "per_arch": {a: {"n_params": ds.stacks[a].n_params,
                           "n_layers": ds.stacks[a].n_layers,
                           "block_size": ds.stacks[a].block_size,
+                          "extra_size": ds.stacks[a].extra_size,
                           "fitted_k": pcas[a].n_components,
                           "variance_captured_at_k": float(np.sum(
                               pcas[a].explained_variance_ratio_[:k])),
-                          "spectrum_ev0_over_evlast": float(
-                              pcas[a].gram_evals_[0] /
-                              max(pcas[a].gram_evals_[min(k, pcas[a].n_components) - 1],
-                                  1e-300))}
+                          **{f"spectrum_{key}": val for key, val in
+                             spectrum_stats(pcas[a].gram_evals_,
+                                            min(k, pcas[a].n_components)).items()}}
                       for a in ds.arch_list},
     }
+    summary["ensemble_fingerprint"] = ens_fp
+    summary["pca_fingerprints"] = pca_fps
+    summary["code_stats_fingerprint"] = code_stats.fingerprint()
     with open(os.path.join(run_root, f"pipeline_summary_k{k}.json"), "w") as f:
         json.dump(summary, f, indent=2)
+
+    # Derived index over the per-directory metas. Rebuilt by scanning rather than
+    # incrementally maintained, so the two train_stack invocations in one Slurm job
+    # cannot race each other into a lost section.
+    rebuild_manifest(run_root)
+
     print(f"\n{ts()} Done. Artifacts under {run_root}")
     for a, d in summary["per_arch"].items():
         print(f"  {a:16s} D={d['n_params']:>13,}  fitted_k={d['fitted_k']:>4d}  "
               f"var@k={d['variance_captured_at_k']:.4%}  "
-              f"ev0/evk={d['spectrum_ev0_over_evlast']:.4g}")
+              f"ev0/med={d['spectrum_ev0_over_median']:.4g}  "
+              f"effrank={d['spectrum_effective_rank_ratio']:.3f}")
+
+    # Spectrum flatness is the honest caveat, made visible at the end of every run
+    # rather than left in a JSON nobody opens. RESEARCH_NOTES Experiment 3: a flow
+    # over codes whose aggregate distribution is already Gaussian learns the prior
+    # and adds nothing. Reported on the BULK statistic -- ev0/ev[k-1] reads ~12 on a
+    # pure-noise ensemble at k=N-1 and would hide exactly this.
+    ratios = {a: d["spectrum_ev0_over_median"]
+              for a, d in summary["per_arch"].items()}
+    effs = {a: d["spectrum_effective_rank_ratio"]
+            for a, d in summary["per_arch"].items()}
+    if ratios and min(ratios.values()) < 2.0:
+        print(f"\n  NOTE the retained spectrum is FLAT "
+              f"(min ev0/median = {min(ratios.values()):.3g}, "
+              f"max effective-rank ratio = {max(effs.values()):.3f} of 1.0). For a "
+              f"manufactured noise ensemble that is the expected result, not a "
+              f"problem — but it means the per-family code distribution is "
+              f"near-Gaussian by construction, so any flow fit to it may learn only "
+              f"the prior. Compare flow_codes against gauss_codes, not against "
+              f"pca_only.")
+
+    wb.summary({"pipeline/ensemble_fingerprint": ens_fp,
+                "pipeline/code_stats_fingerprint": code_stats.fingerprint(),
+                "pipeline/min_spectrum_ev0_over_median":
+                    min(ratios.values()) if ratios else None,
+                "pipeline/max_effective_rank_ratio":
+                    max(effs.values()) if effs else None,
+                "pipeline/k": k,
+                "pipeline/include_extra": args.include_extra})
     wb.finish()
 
 

@@ -41,13 +41,22 @@ Three mitigations live here:
 
 from __future__ import annotations
 
-from typing import Tuple
+import json
+import os
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from artifact_io import require_version
 from models.registry import MAX_BLOCKS, N_FAMILIES
+
+# Bumped whenever the on-disk layout under vae_k<k>/ changes.
+#   1 : vae_meta.json + vae_weights.pt, with provenance binding the checkpoint to
+#       an ensemble fingerprint and a code-stats fingerprint. Anything older has
+#       only vae_config.json + a bare vae_best.pt and no provenance at all.
+VAE_LAYOUT_VERSION = 1
 
 
 class ConditionedBlockVAE(nn.Module):
@@ -409,6 +418,7 @@ class StackVAE(nn.Module):
         super().__init__()
         self.code_dim = code_dim
         self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
         self.cond_dim = cond_dim
         self.n_families = n_families
         self.cond_dropout_p = cond_dropout_p
@@ -526,3 +536,142 @@ class StackVAE(nn.Module):
         kl_loss = kl_dims.mean()
         kl_penalty = kl_dims.clamp(min=free_bits).mean() if free_bits > 0.0 else kl_loss
         return recon_loss + beta * kl_penalty, recon_loss, kl_loss
+
+    # ---------------- persistence ----------------
+    #
+    # `vae_best.pt` (a bare state_dict, rewritten on every improving epoch) stays
+    # exactly as it was: turning that into a full save() would rewrite the metadata
+    # JSON up to `epochs` times for no benefit. It is scratch. `vae_weights.pt` +
+    # `vae_meta.json` are the SEALED artifact, written once at the end of training
+    # after the best weights are reloaded.
+
+    CTOR_KEYS = ("code_dim", "latent_dim", "hidden_dim", "cond_dim",
+                 "n_families", "cond_dropout_p")
+
+    def config(self) -> dict:
+        """The ctor kwargs, read straight off self."""
+        return {key: getattr(self, key) for key in self.CTOR_KEYS}
+
+    def save(self, save_dir: str, *, provenance: Optional[dict] = None,
+             code_stats_fingerprint: Optional[str] = None,
+             code_stats_dir: Optional[str] = None,
+             train: Optional[dict] = None) -> None:
+        """Write vae_meta.json + vae_weights.pt into `save_dir`."""
+        os.makedirs(save_dir, exist_ok=True)
+        meta = {
+            "layout_version": VAE_LAYOUT_VERSION,
+            "class": "StackVAE",
+            "config": self.config(),
+            "code_norm": {
+                "means_shape": list(self._code_mean.shape),
+                "stds_shape": list(self._code_std.shape),
+                "code_stats_fingerprint": code_stats_fingerprint,
+                "code_stats_dir": code_stats_dir,
+            },
+            "provenance": provenance or {},
+            "train": train or {},
+        }
+        torch.save(self.state_dict(), os.path.join(save_dir, "vae_weights.pt"))
+        with open(os.path.join(save_dir, "vae_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+        print(f"[StackVAE] sealed → {save_dir} "
+              f"(code_dim={self.code_dim}, latent_dim={self.latent_dim}, "
+              f"trust={meta['provenance'].get('trust', 'unknown')})")
+
+    @classmethod
+    def load(cls, save_dir: str, *, device=None, allow_legacy: bool = False,
+             expect_code_dim: Optional[int] = None,
+             code_stats=None) -> "StackVAE":
+        """
+        Load a sealed StackVAE, refusing anything it cannot verify.
+
+        The legacy fallback (vae_config.json + vae_best.pt) is OFF by default. Those
+        directories carry no provenance at all -- nothing records which ensemble or
+        which code statistics produced them -- and RESEARCH_NOTES misstep 17 is
+        precisely that failure. A full re-run is ~10 minutes on one V100, which is
+        cheaper than debugging a mis-paired checkpoint. Pass allow_legacy=True to
+        adopt one anyway; it gets stamped trust="unverified-legacy", and that label
+        propagates into any flow trained on it and into the rendered report.
+
+        code_stats
+            A run_bundle.CodeStats. When given, its fingerprint must match the
+            sealed one AND the loaded _code_mean/_code_std buffers must match its
+            arrays. That second check is the one that catches the real failure: a
+            vae_k50/ directory left behind by a run whose stage-3 statistics
+            differed.
+        """
+        meta_path = os.path.join(save_dir, "vae_meta.json")
+        legacy_cfg = os.path.join(save_dir, "vae_config.json")
+        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        if not os.path.exists(meta_path):
+            if not (allow_legacy and os.path.exists(legacy_cfg)):
+                raise RuntimeError(
+                    f"Refusing to load {save_dir}: no vae_meta.json. This directory "
+                    f"was written before VAE_LAYOUT_VERSION existed, so nothing "
+                    f"binds it to an ensemble or to a code-stats artifact. A full "
+                    f"re-run is ~10 minutes:\n"
+                    f"    python train_stack.py --run_name <run> --k <k> ...\n"
+                    f"To evaluate it anyway, unprovenanced, pass --allow_legacy_vae.")
+            with open(legacy_cfg) as f:
+                cfg = json.load(f)
+            meta = {"layout_version": VAE_LAYOUT_VERSION, "class": "StackVAE",
+                    "config": cfg, "code_norm": {},
+                    "provenance": {"trust": "unverified-legacy"}, "train": {}}
+            weights = os.path.join(save_dir, "vae_best.pt")
+            print(f"[StackVAE] WARNING adopting LEGACY checkpoint {save_dir}\n"
+                  f"           no provenance: the ensemble and code stats behind "
+                  f"these weights are unknown.\n"
+                  f"           every metric derived from it is marked "
+                  f"trust=unverified-legacy.")
+        else:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            require_version(meta, "layout_version", VAE_LAYOUT_VERSION, save_dir)
+            if meta.get("class") != "StackVAE":
+                raise RuntimeError(
+                    f"Refusing to load {save_dir}: class={meta.get('class')!r}, not "
+                    f"'StackVAE'. ConditionedBlockVAE is the legacy block pipeline "
+                    f"and its codes mean something different.")
+            weights = os.path.join(save_dir, "vae_weights.pt")
+
+        cfg = meta["config"]
+        if expect_code_dim is not None and cfg["code_dim"] != expect_code_dim:
+            raise RuntimeError(
+                f"Refusing to load {save_dir}: VAE code_dim={cfg['code_dim']} but "
+                f"rank k={expect_code_dim} was requested. Train a VAE for this rank "
+                f"(train_stack.py --k {expect_code_dim}).")
+
+        model = cls(**{key: cfg[key] for key in cls.CTOR_KEYS}).to(dev)
+        model.load_state_dict(torch.load(weights, map_location=dev))
+        model.eval()
+
+        if code_stats is not None:
+            sealed = meta.get("code_norm", {}).get("code_stats_fingerprint")
+            got = code_stats.fingerprint()
+            if sealed is not None and sealed != got:
+                raise RuntimeError(
+                    f"Refusing to load {save_dir}: sealed code_stats_fingerprint "
+                    f"{sealed} but the run's codes_k{cfg['code_dim']}/ hashes to "
+                    f"{got}. The VAE was trained on different code statistics. "
+                    f"Re-train, or evaluate the run this VAE belongs to.")
+            want_m = code_stats.torch_means(model._code_mean.device)
+            want_s = code_stats.torch_stds(model._code_std.device)
+            if not torch.allclose(model._code_mean, want_m, rtol=1e-5, atol=1e-8):
+                raise RuntimeError(
+                    f"Refusing to load {save_dir}: the checkpoint's _code_mean "
+                    f"buffer disagrees with codes_k{cfg['code_dim']}/code_stats.npz "
+                    f"(max|Δ|={float((model._code_mean - want_m).abs().max()):.3g}). "
+                    f"The artifact is canonical; this checkpoint is stale.")
+            if not torch.allclose(model._code_std, want_s, rtol=1e-5, atol=1e-8):
+                raise RuntimeError(
+                    f"Refusing to load {save_dir}: the checkpoint's _code_std "
+                    f"buffer disagrees with codes_k{cfg['code_dim']}/code_stats.npz "
+                    f"(max|Δ|={float((model._code_std - want_s).abs().max()):.3g}). "
+                    f"The artifact is canonical; this checkpoint is stale.")
+
+        model.loaded_meta = meta
+        print(f"[StackVAE] loaded {save_dir} (code_dim={cfg['code_dim']}, "
+              f"latent_dim={cfg['latent_dim']}, "
+              f"trust={meta.get('provenance', {}).get('trust', 'unknown')})")
+        return model

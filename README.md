@@ -165,21 +165,34 @@ LLM-VAE-Early/
 ├── data/ensemble_dataset.py    # EnsembleDataset: per-family ensembles of whole stacks
 ├── dual_gram_pca.py            # DualGramPCA: never builds the (k, D) basis
 ├── vae.py            (StackVAE)# family-only conditioning, per-family code norm
+├── flow.py                     # conditional rectified flow, codes OR VAE-latent space
+├── artifact_io.py              # leaf: version gates, fingerprints, atomic writes
+├── run_bundle.py               # CodeStats + load_run(): reconstitute a whole run
 ├── train_stack.py              # ensembles -> per-family PCA -> codes -> StackVAE
-├── eval_stack.py               # pca_only / vae / generate arms, any rank
+├── train_flow.py               # trains a flow from the 40 KB codes artifact alone
+├── eval_stack.py               # eight arms, any rank, optional benchmark axis
+├── report_stack.py             # renders arch x k x arm as markdown (pure stdlib)
+├── diag_flow_dispersion.py     # do generative arms have the RIGHT SPREAD? (misstep 19)
+├── diag_flow_capacity.py       # is flow contraction underfitting, or finite-sample?
 ├── calibrate_noise.py          # measures the usable augmentation-noise band
-├── slurm_stack_run.sh          # full run: both rank arms, all eval arms
+├── slurm_stack_run.sh          # ensembles + PCA + VAEs at both ranks
+├── slurm_flow_run.sh           # flows in both spaces + all-arm dPPL eval + report
+├── slurm_stack_bench.sh        # MMLU / HellaSwag / GPQA, eval only
 ├── slurm_stack_smoke.sh        # tiny-mode end-to-end check (~1 min)
+├── slurm_flow_smoke.sh         # tiny-mode end-to-end WITH flows and all 8 arms
 ├── slurm_calibrate_noise.sh
 │
 │  ===== TESTS =====
 ├── tests_step1_dual_pca.py     # 35 checks: numerics, rank floor, codes I/O
 ├── tests_step3_ensemble.py     # 56 checks: ensemble + DualGramPCA vs brute force
+├── tests_step4_run_bundle.py   # 60 checks: fingerprints, CodeStats, save/load
+├── tests_step5_flow.py         # 91 checks: interpolant, Euler, spaces, save/load
+├── tests_step6_report_stack.py # 76 checks: reporting; pure stdlib, `short` partition
 ├── slurm_tests.sh              # runs a test module on a compute node
 │
 │  ===== SHARED =====
 ├── models/registry.py          # ARCH_CONFIGS, family_idx, tiny mocks
-├── models/weight_extractor.py  # block flatten/reconstruct, exclude_1d
+├── models/weight_extractor.py  # stack + block flatten/reconstruct, exclude_1d
 ├── data/val_loader.py          # WikiText-2 loader
 ├── data/mc_loader.py           # MMLU / HellaSwag / GPQA loaders
 ├── wandb_utils.py
@@ -210,7 +223,11 @@ legacy.
 ```
 Stage 1 ─ Ensembles                                    (data/ensemble_dataset.py)
    Load one model per architecture.
-   Concatenate its decoder blocks into w_0, length D = n_layers * block_size.
+   Flatten the WHOLE network: [extra | block_0 ... block_{L-1}], where `extra` is
+   the embeddings, the final norm and the LM head. The extra segment is derived as
+   the COMPLEMENT of the layers_attr subtree in named_parameters(), so it needs no
+   per-arch config and weight tying is handled free (a tied lm_head/wte pair is
+   yielded once). Pass --no_include_extra for a decoder-only run.
    Check that all blocks in the family have the same size. Fail if they do not.
    Save w_0 only. Members 1..N-1 exist as a seed, never as a file.
    ↓
@@ -220,13 +237,32 @@ Stage 2 ─ Per-family Gram PCA at k = N-1              (dual_gram_pca.py)
    eigh on C. Drop eigenvalues below the rank floor.
    Codes are U*sqrt(S). No pass over the data. No (k, D) basis.
    ↓
-Stage 3 ─ Codes at rank k
+Stage 3 ─ Codes at rank k                              (run_bundle.CodeStats)
    Take the first k columns. A k-prefix IS the rank-k PCA.
-   Record each family's own code mean and scale.
+   Record each family's own code mean and scale, and SEAL them to
+   runs/<run>/codes_k<k>/ with a content fingerprint.
    ↓
 Stage 4 ─ StackVAE
    Conditioned on family_idx only.
    Free bits, conditioning dropout, cosine LR, warmup-gated checkpointing.
+   Sealed once at the end as vae_weights.pt + vae_meta.json.
+```
+
+```
+Stage 5 ─ Conditional rectified flow                   (train_flow.py, flow.py)
+   A SEPARATE job, in either of two interchangeable target spaces:
+     codes   dim = k   target = per-family-normalized PCA codes
+     latent  dim = 32  target = the StackVAE posterior mean mu(codes)
+   x0 ~ N(0, I); x_t = (1-t)x0 + t*x1; target u = x1 - x0; MSE; Euler at sample
+   time. Family conditioning follows StackVAE (embedding + learned null_cond +
+   conditioning dropout), so classifier-free guidance is available -- DeepWeightFlow
+   has no unconditional branch and therefore no CFG.
+
+   train_flow.py reads ONLY runs/<run>/codes_k<k>/ (~40 KB) plus vae_k<k>/ for the
+   latent space. It never constructs an EnsembleDataset or touches DualGramPCA.
+   That is what makes this stage re-runnable on a different ensemble source (Pythia
+   checkpoint revisions) with no change to flow code: swap the source, re-run
+   stages 1-3, and this stage is untouched and unaware.
 ```
 
 Fit Stage 2 once. Every lower rank is a column prefix of that fit, so a rank sweep
@@ -234,9 +270,20 @@ costs nothing extra.
 
 ```bash
 sbatch slurm_stack_smoke.sh          # tiny mode, ~1 minute, no downloads
-sbatch slurm_stack_run.sh            # full run, ~10 minutes on one V100
-RUN=myrun N_SAMPLES=143 NOISE_SCALE=3e-3 sbatch slurm_stack_run.sh
+sbatch slurm_flow_smoke.sh           # tiny mode WITH flows + all 8 arms, ~6 min
+RUN=emb3 sbatch slurm_stack_run.sh   # ensembles + PCA + VAEs at k=N-1 and k=N/2
+RUN=emb3 sbatch slurm_flow_run.sh    # flows both spaces + all-arm dPPL + report
+SAMPLE_IDX=5 RUN=emb3 sbatch slurm_flow_run.sh    # the typical-member target
+RUN=emb3 sbatch slurm_stack_bench.sh              # MMLU / HellaSwag / GPQA
 ```
+
+`slurm_flow_run.sh` SKIPS a flow that is already sealed rather than retraining it, so
+running it twice with different `SAMPLE_IDX` trains the flows once and evaluates
+twice. `--out_suffix` keeps the benchmark job's results from overwriting the dPPL
+job's at the same `--sample_idx`.
+
+`ARCH_LIST` is the only change needed for the six-family follow-up: `N_FAMILIES` is
+already 6.
 
 ### Block pipeline (legacy)
 
@@ -321,20 +368,40 @@ each other.
 ```
 /scratch/biggs.s/llm_vae/
 ├── runs/
-│   ├── perfam/                            <- a stack run
+│   ├── emb3/                              <- a stack run
+│   │   ├── run_manifest.json              a DERIVED index; rebuild_manifest()
+│   │   │                                  re-derives it by scanning, so a lost
+│   │   │                                  concurrent update costs nothing
 │   │   ├── ensemble/
-│   │   │   ├── ensemble_meta.json         (N, noise_scale, seed, layout_version)
-│   │   │   └── <arch>_w0.npy              (D,) float32 — the real stack, ~1.2 GB
+│   │   │   ├── ensemble_meta.json         (N, noise_scale, seed, layout_version,
+│   │   │   │                               include_extra, extra_schema)
+│   │   │   └── <arch>_w0.npy              (D,) float32 — the real stack, ~1.4 GB
 │   │   ├── pca/<arch>/
 │   │   │   ├── mean.npy                   (D,) float32
 │   │   │   ├── gram_evals.npy             (k,)  float64
 │   │   │   ├── gram_evecs.npy             (N,k) float64
 │   │   │   ├── codes.npy                  (N,k) float32
 │   │   │   └── gram_pca_meta.json
+│   │   ├── codes_k99/  codes_k50/         ~40 KB — ALL train_flow.py needs
+│   │   │   ├── code_stats.npz             means (F,k) f32, stds (F,1) f32
+│   │   │   ├── codes.npy                  (M,k) f32
+│   │   │   ├── family_idxs.npy            (M,)  i64
+│   │   │   └── code_stats_meta.json       fingerprint + provenance
 │   │   ├── vae_k99/  vae_k50/
-│   │   │   ├── vae_best.pt, vae_config.json, train_metrics.json
-│   │   ├── results/stack_eval_results*.json
-│   │   └── pipeline_summary_k*.json
+│   │   │   ├── vae_weights.pt             the SEALED artifact
+│   │   │   ├── vae_meta.json              layout_version, config, provenance,
+│   │   │   │                              code_stats_fingerprint, trust
+│   │   │   └── vae_best.pt, train_metrics.json     (rolling scratch)
+│   │   ├── flow_k99_codes/  flow_k99_latent/  flow_k50_*/
+│   │   │   ├── flow_weights.pt
+│   │   │   └── flow_meta.json             net/flow config, space_state (sealed
+│   │   │                                  mu stats for latent), defaults, and
+│   │   │                                  train.spectrum — so the flatness caveat
+│   │   │                                  travels WITH the checkpoint
+│   │   ├── results/stack_eval_results*.json    ('' | _s<idx> | _<out_suffix>)
+│   │   ├── results/report_stack.md
+│   │   └── pipeline_summary_k*.json       incl. spectrum_ev0_over_median and
+│   │                                      spectrum_effective_rank_ratio
 │   └── 2026-08-21-shared-6family/         <- archived legacy run (JSONs only)
 ├── logs/                                  <- all slurm .out/.err
 └── hf_cache/
@@ -559,6 +626,56 @@ and ΔPPL ≈ 0 there is the *expected* result, not a finding.
 the *smallest* weight std (0.0287 vs 0.107 and 0.178) — so its fragility is about the
 function, not the weight scale.
 
+> **Superseded.** This table was measured on decoder blocks only, and the conclusion
+> in the paragraph above is **inverted** once embeddings enter `D`. See the next
+> section.
+
+### 2026-09-02: re-calibrated on the whole stack — and the previous conclusion was backwards
+
+Embeddings, the final norm and the untied LM head are now inside `D`, so the old table
+does not transfer. Re-measured on the same instrument (WikiText-2, 64 × 1024, one
+noise draw reused across scales — job 9894023):
+
+| `s` | gpt2_medium | smollm2_360m | pythia_410m |
+|---|---|---|---|
+| 1e-4 | +0.003% | −0.001% | −0.000% |
+| 1e-3 | +0.070% | −0.003% | +0.005% |
+| **3e-3** | **+0.449%** | **+0.030%** | **+0.075%** |
+| 5e-3 | +1.151% | +0.116% | +0.228% |
+| 1e-2 | +4.363% | +0.567% | +0.994% |
+| 3e-2 | +43.933% | +5.862% | +11.021% |
+
+`s = 3e-3` is the new calibrated value — the largest scale keeping every family within
++0.5%, and still ~4.5 orders of magnitude above float32 epsilon.
+
+**The prediction going in was wrong, and so was the reasoning.** I expected
+`pythia_410m` to degrade most, because it has the largest extra segment (25.4% of `D`)
+and its LM head is untied, so about a quarter of its stack is logit-facing. It barely
+moved: +0.956% → +0.994% at `s = 1e-2`. `gpt2_medium` got **45× worse**: +0.097% →
++4.363%, and is now the binding constraint.
+
+The mechanism is the **global `weight_std`**, which is the single number the noise is
+scaled by:
+
+| arch | global `weight_std` | extra segment | `D` |
+|---|---|---|---|
+| gpt2_medium | 0.1083 | 14.8% | 354,501,632 |
+| smollm2_360m | 0.1717 | 13.0% | 361,758,720 |
+| pythia_410m | 0.0277 | 25.4% | 405,012,480 |
+
+`gpt2_medium`'s global std is 3.9× `pythia_410m`'s, so at equal `s` it takes 3.9× more
+*absolute* perturbation — onto embeddings whose own scale is comparable across the
+three families. A family with a wide internal spread of per-tensor stds gets its
+small-magnitude tensors over-perturbed and its large ones under-perturbed. So the
+earlier reading ("fragility is about the function, not the weight scale") had it
+backwards: at fixed `s` the weight scale *is* what sets the absolute perturbation, and
+the previous table hid that by excluding the tensors where the mismatch is largest.
+
+This is an argument for per-parameter-group noise scaling (`s · std(tensor)` rather
+than `s · std(stack)`). Not implemented — it redefines the ensemble and so invalidates
+every fingerprint, which makes it a property of a run that starts with it rather than
+a retrofit. Filed as RESEARCH_NOTES open question 6, mechanism recorded as misstep 18.
+
 ### 2026-08-26: whole-stack run — machinery works, the rank sweep does not
 
 Job 9715570, 10 minutes end to end: 3 per-family PCA fits (N=100, D~302M), two
@@ -747,6 +864,25 @@ python report.py --results_dir ./results              # print to stdout
 python report.py --results_dir ./results --output report.md
 ```
 
+**Use `report_stack.py` for the stack pipeline.** `report.py` cannot read the stack
+schema at all: its formatters assume `{arch: {...}}` — one flat row per arch — while
+the stack schema is `{"<arch>@k<k>": {..., "arms": {...}}}`, a three-axis cube
+(arch x k x arm) that has to be pivoted. `report_stack.parse_key` therefore RAISES on
+a legacy flat key rather than rendering a table of blanks that looks like a run where
+nothing worked. `report_stack.py` is stdlib-pure too, and never calls
+`run_bundle.load_run` (constructing an `EnsembleDataset` creates directories, so
+`load_run` is not a pure read).
+
+```bash
+python report_stack.py --run_dir ./runs/emb3 --output report_stack.md
+python report_stack.py --run_dir ./runs/emb3 --inspect        # manifest only
+```
+
+Its `caveats()` block is emitted ABOVE the tables, and every warning in it is a
+recorded misstep that already cost time once: `sample_idx = 0` (misstep 9),
+`pca_only` at k=N−1 (12), a negative ΔPPL (14), a flat training spectrum (15b), a
+missing `gauss_codes` null arm, and any `trust = unverified-legacy` artifact.
+
 ## Evaluation Targets
 
 ### Stack pipeline
@@ -761,9 +897,43 @@ Read `runs/<name>/results/stack_eval_results*.json`.
 | relL2, `pca_only`, k=N/2 | ≈ `s/√2` for a typical member | stack_eval_results.json |
 | Total KL | 1–20 nats/sample, stable after β reaches 1.0 | vae_k*/train_metrics.json |
 | Active latent units | most of `latent_dim` | wandb `kl/active_units` |
-| Spectrum `ev[0]/ev[k−2]` | < ~3 for a noise ensemble (flat) | pipeline_summary_k*.json |
+| `code_rms_ratio`, generative arms | ≈ 1.0; below 0.8 is collapse | stack_eval_results*.json |
+| Spectrum `ev0/median` | ≈ 1 for a noise ensemble (flat) | pipeline_summary_k*.json |
+| Spectrum effective-rank ratio | ≈ 1 for a noise ensemble (flat) | pipeline_summary_k*.json |
+| ODE round-trip `rel_l2` | must fall like 1/n_steps | `flow_rt_*` arms |
 
-Four rules for reading these numbers:
+**The eight arms.** All eight share one code path: write the reconstruction into the
+live model, measure, restore.
+
+| arm | path | what it isolates |
+|---|---|---|
+| `pca_only` | project + inverse_transform | basis capacity (self-test at k=N−1) |
+| `vae` | encode + decode the codes | the VAE's own cost |
+| `generate` | z ~ N(0,I) → `vae.decode_cfg` | VAE prior sample |
+| `gauss_codes` | z ~ N(mean_f, std_f) from `code_stats` | **the null model the flows must beat** |
+| `flow_codes` | flow sample in code space | flow over PCA codes |
+| `flow_latent` | flow sample in VAE latent space | flow over VAE latents |
+| `flow_rt_codes` | encode → reverse ODE → forward ODE | ODE consistency, codes |
+| `flow_rt_latent` | same, latent space | ODE consistency, latent |
+
+**`gauss_codes` is the arm that decides whether any `flow_codes` number means
+anything.** On a manufactured ensemble the per-family code distribution is
+near-Gaussian by construction, so `flow_codes` vs `pca_only` carries no information
+about the flow; `flow_codes` vs `gauss_codes` does. It costs one `inverse_transform`
+and zero training.
+
+> **ΔPPL alone is NOT sufficient for a generative arm, and `gauss_codes` cannot fix
+> that.** The ensemble mean is essentially `w_0`, so a collapsed generator scores
+> ΔPPL ≈ 0 — beating an honest sample — while generating nothing. On `emb3`,
+> `flow_codes` beat `gauss_codes` by 43× on ΔPPL while emitting codes at **0.25× the
+> correct RMS**. Always run `diag_flow_dispersion.py` before reading a generative
+> ΔPPL. See RESEARCH_NOTES misstep 19.
+
+Note that `--guidance_scale` and `--flow_guidance_scale` are DIFFERENT mechanisms —
+CFG on the VAE decoder and CFG on the velocity field. `flow_latent` applies both.
+Multiplying them together is meaningless.
+
+Five rules for reading these numbers:
 
 1. **`pca_only` at k=N−1 is a self-test, not a result.** The rank bound makes it exact.
    A value other than cosine 1.000000 means a bug.
@@ -773,6 +943,10 @@ Four rules for reading these numbers:
    ensemble centre, so its truncation residual is smaller by √N.
 4. **Error magnitude does not predict functional damage.** The VAE's 2e-3 error cost
    pythia_410m +0.378% PPL. An isotropic 2e-3 perturbation costs about +0.03%.
+5. **Read `ev0/median`, not `ev[0]/ev[k−1]`.** At the rank bound the latter describes
+   the smallest direction surviving the rank floor, not the bulk: it reads 12.09 at
+   k=N−1 and 1.006 at k=N/2 on the *same* pure-noise ensemble. Same trap as
+   `total_variance_captured` being vacuous at k=N−1 (missteps 15 and 15b).
 
 ### Block pipeline (legacy)
 
@@ -802,7 +976,7 @@ Read that file before you start work. It records:
 
 - what the machinery can and cannot currently measure, and why;
 - the next experiment, with the artifacts that would prove or disprove it;
-- **17 recorded missteps**, so nobody repeats them.
+- **21 recorded missteps**, so nobody repeats them.
 
 The single most important item: the noise-augmented ensemble validates machinery but
 cannot answer a research question. The next experiment needs an ensemble of genuinely

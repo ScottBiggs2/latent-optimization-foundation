@@ -9,7 +9,7 @@ block to a shared `max_block_size`, and fits ONE basis over all families.
 This module follows DeepWeightFlow (arXiv 2601.05052), which `dual_pca.py` is adapted
 from, where **one PCA sample is the final weight vector of one complete network**:
 
-    sample  = the whole decoder stack, flattened   (D_f = n_layers x block_size)
+    sample  = the whole network, flattened  (D_f = extra + n_layers x block_size)
     N       = the number of complete models in the ensemble
     k       = N - 1 (the rank bound) or N // 2
     basis   = one per architecture
@@ -53,7 +53,7 @@ from __future__ import annotations
 import gc
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -62,10 +62,14 @@ import torch
 from models.registry import (
     build_tiny_model, get_arch_config, get_layers, list_archs, load_model,
 )
-from models.weight_extractor import ParamEntry, extract_block_flat
+from models.weight_extractor import (
+    ParamEntry, extract_block_flat, extract_extra_flat,
+)
 
 # Bumped whenever the on-disk layout under <artifact_dir>/ensemble/ changes.
-ENSEMBLE_LAYOUT_VERSION = 1
+#   1 -> 2 : a stack became [extra | block_0 .. block_{L-1}] instead of blocks
+#            alone, so D and every code, basis and checkpoint changed meaning.
+ENSEMBLE_LAYOUT_VERSION = 2
 
 # Target bytes for one in-flight chunk across all samples. 512 MB keeps a 100-sample
 # ensemble comfortably inside a 32 GB GPU alongside the Gram accumulator.
@@ -79,19 +83,33 @@ MAX_CHUNK_ELEMS = 8_388_608
 
 @dataclass
 class ArchStack:
-    """One architecture's real weight stack plus everything needed to write it back."""
+    """
+    One architecture's real weight stack plus everything needed to write it back.
+
+    Layout is  [extra | block_0 .. block_{L-1}]  where `extra` is the embeddings,
+    the final norm, and the LM head when untied. The extra segment leads rather
+    than trails so that `block_slice` stays a single offset add and so a
+    decoder-only stack (extra_size == 0) has byte-identical block offsets to the
+    layout_version 1 ensembles.
+    """
     arch: str
     family_idx: int
     n_layers: int
     block_size: int          # params per block (uniform within the family)
-    n_params: int            # D = n_layers * block_size
+    n_params: int            # D = extra_size + n_layers * block_size
     weight_std: float
     schema: List[ParamEntry]  # per-block schema; identical for every block
     w0_path: str
+    extra_size: int = 0
+    extra_schema: List[ParamEntry] = field(default_factory=list)
+
+    def extra_slice(self) -> Tuple[int, int]:
+        """Offsets of the extra segment. It leads the stack, so it starts at 0."""
+        return 0, self.extra_size
 
     def block_slice(self, block_idx: int) -> Tuple[int, int]:
         """Offsets of block `block_idx` within the flattened stack."""
-        lo = block_idx * self.block_size
+        lo = self.extra_size + block_idx * self.block_size
         return lo, lo + self.block_size
 
 
@@ -106,6 +124,10 @@ class EnsembleDataset:
     noise_scale   : augmentation std as a fraction of the stack's own weight std
     exclude_1d    : omit norm gains and biases from the flat vector, so they keep
                     their pretrained values on write-back
+    include_extra : include the embeddings, final norm and LM head in the stack.
+                    DeepWeightFlow flattens whole networks, and gpt2_medium's
+                    embedding alone is ~17% of its parameters, so this is on by
+                    default. Set False to reproduce a decoder-blocks-only run.
     mode          : 'full' (pretrained) or 'tiny' (random-init, for smoke tests)
     artifact_dir  : root for the ensemble/ subdirectory
     seed          : base seed for noise generation
@@ -118,6 +140,7 @@ class EnsembleDataset:
         n_samples: int = 100,
         noise_scale: float = 1e-2,
         exclude_1d: bool = True,
+        include_extra: bool = True,
         mode: str = "full",
         artifact_dir: str = "/scratch/biggs.s/llm_vae",
         seed: int = 42,
@@ -134,6 +157,7 @@ class EnsembleDataset:
         self.n_samples = int(n_samples)
         self.noise_scale = float(noise_scale)
         self.exclude_1d = bool(exclude_1d)
+        self.include_extra = bool(include_extra)
         self.mode = mode
         self.artifact_dir = artifact_dir
         self.seed = int(seed)
@@ -162,6 +186,15 @@ class EnsembleDataset:
             cfg = get_arch_config(arch)
             layers = get_layers(model, arch)
 
+            # The extra segment is the complement of the block subtree, so it
+            # picks up embeddings / final norm / untied LM head without any
+            # per-architecture configuration. See weight_extractor's docstring.
+            if self.include_extra:
+                extra, extra_schema = extract_extra_flat(
+                    model, arch, exclude_1d=self.exclude_1d)
+            else:
+                extra, extra_schema = np.zeros(0, dtype=np.float32), []
+
             flats, schemas = [], []
             for layer in layers:
                 flat, schema = extract_block_flat(layer, exclude_1d=self.exclude_1d)
@@ -184,7 +217,7 @@ class EnsembleDataset:
                 if [(e.name, e.shape) for e in sch] != names0:
                     raise ValueError(f"{arch}: block {i} schema differs from block 0")
 
-            w0 = np.concatenate(flats).astype(np.float32)
+            w0 = np.concatenate([extra] + flats).astype(np.float32)
             w0_path = os.path.join(self.ens_dir, f"{arch}_w0.npy")
             np.save(w0_path, w0)
 
@@ -197,11 +230,20 @@ class EnsembleDataset:
                 weight_std=float(w0.std()),
                 schema=schemas[0],
                 w0_path=w0_path,
+                extra_size=int(extra.size),
+                extra_schema=extra_schema,
             )
+            pct = 100.0 * extra.size / max(w0.size, 1)
             print(f"  {arch}: L={len(layers)}  block={block_size:,}  "
+                  f"extra={extra.size:,} ({pct:.1f}%)  "
                   f"D={w0.size:,}  std={w0.std():.6g}")
+            if self.include_extra and extra.size == 0:
+                raise ValueError(
+                    f"{arch}: include_extra=True but no parameters were found "
+                    f"outside '{cfg['layers_attr']}'. That layers_attr is probably "
+                    f"wrong, or exclude_1d removed everything.")
 
-            del model, flats, schemas, w0
+            del model, flats, schemas, w0, extra
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -215,6 +257,7 @@ class EnsembleDataset:
             "n_samples": self.n_samples,
             "noise_scale": self.noise_scale,
             "exclude_1d": self.exclude_1d,
+            "include_extra": self.include_extra,
             "mode": self.mode,
             "seed": self.seed,
             "chunk_budget_bytes": self.chunk_budget_bytes,
@@ -226,6 +269,8 @@ class EnsembleDataset:
                     "n_params": s.n_params,
                     "weight_std": s.weight_std,
                     "schema": [[e.name, list(e.shape)] for e in s.schema],
+                    "extra_size": s.extra_size,
+                    "extra_schema": [[e.name, list(e.shape)] for e in s.extra_schema],
                     "w0_path": s.w0_path,
                 }
                 for a, s in self.stacks.items()
@@ -250,6 +295,7 @@ class EnsembleDataset:
         for key, mine in (("n_samples", self.n_samples),
                           ("noise_scale", self.noise_scale),
                           ("exclude_1d", self.exclude_1d),
+                          ("include_extra", self.include_extra),
                           ("seed", self.seed),
                           ("mode", self.mode)):
             if meta.get(key) != mine:
@@ -275,6 +321,9 @@ class EnsembleDataset:
                 weight_std=float(d["weight_std"]),
                 schema=[ParamEntry(n, tuple(s)) for n, s in d["schema"]],
                 w0_path=d["w0_path"],
+                extra_size=int(d.get("extra_size", 0)),
+                extra_schema=[ParamEntry(n, tuple(sh))
+                              for n, sh in d.get("extra_schema", [])],
             )
         print(f"[EnsembleDataset] reusing {self.ens_dir} "
               f"(N={self.n_samples}, noise_scale={self.noise_scale})")
@@ -384,11 +433,13 @@ class EnsembleDataset:
 
     def summary(self) -> str:
         lines = [f"EnsembleDataset  N={self.n_samples}  "
-                 f"noise_scale={self.noise_scale}  exclude_1d={self.exclude_1d}"]
+                 f"noise_scale={self.noise_scale}  exclude_1d={self.exclude_1d}  "
+                 f"include_extra={self.include_extra}"]
         for a in self.arch_list:
             s = self.stacks[a]
             nb = len(self.chunk_bounds(a))
             lines.append(f"  {a:16s} L={s.n_layers:3d}  block={s.block_size:>12,}  "
+                         f"extra={s.extra_size:>12,}  "
                          f"D={s.n_params:>13,}  chunks={nb:>5d}  "
                          f"std={s.weight_std:.4g}")
         return "\n".join(lines)

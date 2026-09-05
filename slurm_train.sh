@@ -43,9 +43,6 @@
 # then export HF_TOKEN in your shell before submitting — sbatch inherits it
 # automatically:
 #   export HF_TOKEN=hf_...  &&  MC_EVAL=1 sbatch slurm_train.sh
-# Do NOT hardcode a token into this file — it's tracked by git.
-# Training/PCA/VAE stages are checkpointed, so resubmitting with MC_EVAL=1 on
-# an existing artifact_dir skips straight to the new evaluation stage.
 
 #SBATCH --job-name=llm_vae_train
 #SBATCH --output=/scratch/biggs.s/llm_vae/slurm_%j.out

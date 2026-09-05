@@ -33,8 +33,21 @@ echo; echo "############ train k=6 (N/2) — must reuse the Stage 2 fits #######
 python -u train_stack.py $COMMON --k 6
 
 echo; echo "############ eval both ranks, all three arms ############"
+# --bench synthetic exercises the MC plumbing without a download. Real benchmarks
+# are REFUSED in tiny mode on purpose: a random-init model scores at chance, so an
+# mmlu delta here would be noise dressed as a measurement.
 python -u eval_stack.py --artifact_dir "$ROOT" --run_name "$RUN" --mode tiny \
     --k 11 6 --arms pca_only vae generate \
+    --bench synthetic --bench_n_questions 8 \
     --eval_seq_len 64 --eval_n_sequences 4 --no_wandb
+
+echo; echo "############ tiny mode must REFUSE a real benchmark ############"
+if python -u eval_stack.py --artifact_dir "$ROOT" --run_name "$RUN" --mode tiny \
+       --k 11 --arms pca_only --bench mmlu --no_wandb 2>&1 | tee /dev/stderr \
+       | grep -q "Refusing --bench"; then
+    echo "  OK: refused as designed"
+else
+    echo "  FAIL: tiny mode accepted a real benchmark"; exit 1
+fi
 
 echo; echo "SMOKE OK"

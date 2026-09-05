@@ -279,9 +279,12 @@ def test_real_ensemble_dataset() -> None:
 
         for arch in ds.arch_list:
             st = ds.stacks[arch]
-            check(f"{arch}: D == L * block_size",
-                  st.n_params == st.n_layers * st.block_size,
-                  f"{st.n_params} vs {st.n_layers}*{st.block_size}")
+            check(f"{arch}: D == extra + L * block_size",
+                  st.n_params == st.extra_size + st.n_layers * st.block_size,
+                  f"{st.n_params} vs {st.extra_size}+{st.n_layers}*{st.block_size}")
+            check(f"{arch}: extra segment is non-empty",
+                  st.extra_size > 0 and len(st.extra_schema) > 0,
+                  f"extra_size={st.extra_size}, {len(st.extra_schema)} entries")
 
             bounds = ds.chunk_bounds(arch)
             covered = sum(r1 - r0 for r0, r1 in bounds)
@@ -311,11 +314,17 @@ def test_real_ensemble_dataset() -> None:
                   0.7 * want < spread < 1.4 * want,
                   f"measured={spread:.4g}, want={want:.4g}")
 
-            # Block slicing must line up with the concatenation order.
+            # Block slicing must line up with the concatenation order, which now
+            # starts after the extra segment.
             lo, hi = st.block_slice(1)
-            check(f"{arch}: block_slice(1) is the second block",
-                  (lo, hi) == (st.block_size, 2 * st.block_size),
-                  f"({lo}, {hi})")
+            check(f"{arch}: block_slice(1) is offset past the extra segment",
+                  (lo, hi) == (st.extra_size + st.block_size,
+                               st.extra_size + 2 * st.block_size),
+                  f"({lo}, {hi}) with extra_size={st.extra_size}")
+            check(f"{arch}: extra_slice leads the stack",
+                  st.extra_slice() == (0, st.extra_size))
+            check(f"{arch}: last block ends exactly at D",
+                  st.block_slice(st.n_layers - 1)[1] == st.n_params)
 
         # Cache-invalidation: reusing the dir with different ensemble params must
         # refuse rather than silently serve a different ensemble.
@@ -327,8 +336,133 @@ def test_real_ensemble_dataset() -> None:
         except RuntimeError as exc:
             raised = "noise_scale" in str(exc)
         check("changing noise_scale invalidates the cached ensemble", raised)
+
+        # include_extra changes D, so it must invalidate too -- otherwise a
+        # decoder-only basis gets silently reused against a wider ensemble.
+        raised = False
+        try:
+            EnsembleDataset(arch_list=["gpt2_medium"], n_samples=8,
+                            noise_scale=1e-2, exclude_1d=True, mode="tiny",
+                            include_extra=False, artifact_dir=tmp, seed=7)
+        except RuntimeError as exc:
+            raised = "include_extra" in str(exc)
+        check("changing include_extra invalidates the cached ensemble", raised)
     finally:
         shutil.rmtree(tmp)
+
+
+# ---------------------------------------------------------------------------
+# The extra segment: embeddings / final norm / untied LM head
+# ---------------------------------------------------------------------------
+
+def test_extra_segment() -> None:
+    print("\n--- extra segment (embeddings / final norm / LM head) ---")
+    from models.registry import build_tiny_model, get_arch_config, get_layers
+    from models.weight_extractor import (
+        build_stack_spec, extract_extra_flat, read_stack_from_model,
+        write_stack_to_model,
+    )
+
+    for arch in ("gpt2_medium", "smollm2_360m", "pythia_410m"):
+        model = build_tiny_model(arch)
+        prefix = get_arch_config(arch)["layers_attr"] + "."
+
+        w0, spec = build_stack_spec(model, arch, exclude_1d=True,
+                                    include_extra=True)
+
+        # The strongest available check that tying is neither double-counted nor
+        # dropped: D must equal the model's own count of UNIQUE >=2-D parameters.
+        # named_parameters() deduplicates shared tensors, so a tied lm_head/wte
+        # pair contributes once. Double-counting would overshoot, omitting the
+        # extra segment would undershoot.
+        unique = sum(p.numel() for _, p in model.named_parameters()
+                     if p.dim() >= 2)
+        check(f"{arch}: D equals the model's unique >=2-D parameter count",
+              spec.n_params == unique, f"{spec.n_params:,} vs {unique:,}")
+
+        names = [e.name for e in spec.extra_schema]
+        check(f"{arch}: extra schema names are unique",
+              len(names) == len(set(names)), f"{len(names)} entries")
+        check(f"{arch}: no extra entry lives inside the block subtree",
+              not any(n.startswith(prefix) for n in names))
+        check(f"{arch}: exclude_1d left no 1-D entry in the extra schema",
+              all(len(e.shape) >= 2 for e in spec.extra_schema))
+
+        # extract -> write -> re-extract must be bit-identical, which is what makes
+        # restore() trustworthy between evaluation arms.
+        rt = read_stack_from_model(model, arch, spec)
+        check(f"{arch}: read_stack_from_model reproduces build_stack_spec",
+              np.array_equal(rt, w0))
+
+        perturbed = (w0 + 0.1).astype(np.float32)
+        write_stack_to_model(perturbed, model, arch, spec)
+        after = read_stack_from_model(model, arch, spec)
+        check(f"{arch}: write -> read round trip is bit-identical",
+              np.array_equal(after, perturbed),
+              f"max|Δ|={float(np.abs(after - perturbed).max()):.3g}")
+
+        # And the extra segment specifically must have been written, not skipped.
+        e_after, _ = extract_extra_flat(model, arch, exclude_1d=True)
+        check(f"{arch}: the extra segment was actually written back",
+              np.array_equal(e_after, perturbed[:spec.extra_size]))
+
+        write_stack_to_model(w0, model, arch, spec)
+        check(f"{arch}: restoring w0 undoes the perturbation",
+              np.array_equal(read_stack_from_model(model, arch, spec), w0))
+
+        # include_extra=False must reproduce the layout_version 1 geometry exactly.
+        wb, sb = build_stack_spec(model, arch, exclude_1d=True,
+                                  include_extra=False)
+        check(f"{arch}: include_extra=False gives extra_size 0",
+              sb.extra_size == 0 and sb.block_slice(0) == (0, sb.block_size))
+        check(f"{arch}: the two layouts agree on the block region",
+              np.array_equal(wb, w0[spec.extra_size:]),
+              f"{wb.size:,} vs {w0.size - spec.extra_size:,}")
+        check(f"{arch}: blocks-only D == L * block_size",
+              sb.n_params == sb.n_layers * sb.block_size)
+
+        del model
+
+
+def test_tied_lm_head() -> None:
+    """
+    build_tiny_model forces tie_word_embeddings=False, so the tied path is never
+    exercised by the other tests -- yet gpt2_medium and smollm2_360m are BOTH tied
+    in their real checkpoints. Build a tied model explicitly.
+    """
+    print("\n--- tied LM head ---")
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from models.registry import get_arch_config
+    from models.weight_extractor import build_stack_spec
+
+    arch = "gpt2_medium"
+    cfg = get_arch_config(arch)
+    tiny = cfg["tiny_config"].copy()
+    tiny["model_type"] = cfg["hf_model_type"]
+    hf_cfg = AutoConfig.for_model(**tiny)
+    hf_cfg.tie_word_embeddings = True
+    model = AutoModelForCausalLM.from_config(hf_cfg)
+    model.eval()
+
+    tied = model.lm_head.weight.data_ptr() == model.transformer.wte.weight.data_ptr()
+    check("the test model really is tied", tied)
+
+    w0, spec = build_stack_spec(model, arch, exclude_1d=True, include_extra=True)
+    names = [e.name for e in spec.extra_schema]
+
+    check("wte is in the extra schema", "transformer.wte.weight" in names)
+    # named_parameters() yields the shared tensor once, under whichever name it
+    # reaches first. Either name is fine; BOTH would mean double-counting.
+    check("the tied tensor appears exactly once",
+          ("transformer.wte.weight" in names) != ("lm_head.weight" in names)
+          or names.count("transformer.wte.weight") + names.count("lm_head.weight") == 1,
+          f"names={names}")
+
+    unique = sum(p.numel() for _, p in model.named_parameters() if p.dim() >= 2)
+    check("D equals the unique parameter count under tying",
+          spec.n_params == unique, f"{spec.n_params:,} vs {unique:,}")
+    check("D counts the embedding once, not twice",
+          spec.n_params < unique + tiny["vocab_size"] * tiny["n_embd"])
 
 
 def main() -> int:
@@ -349,6 +483,8 @@ def main() -> int:
     test_save_load()
 
     if args.tiny:
+        test_extra_segment()
+        test_tied_lm_head()
         test_real_ensemble_dataset()
     else:
         print("\n(skipping real EnsembleDataset — pass --tiny to include it)")
