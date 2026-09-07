@@ -1,4 +1,12 @@
-# Research Notes — read this before you write code
+# Research Notes (ARCHIVE — superseded 2026-09-06) — read this before you write code
+
+> **This is the OLD notepad. The forward plan lives in
+> [RESEARCH_PLAN.md](RESEARCH_PLAN.md).**
+>
+> This file is still authoritative for two things and should not be deleted:
+> **§5 (the 21 recorded missteps)** and **§6 (environment facts)**. Both carry
+> forward unchanged. Its §4 "next experiments" and §7 "open questions" are
+> superseded — read RESEARCH_PLAN.md for those.
 
 This file has one job. It stops the next agent from repeating work that already
 happened, and from repeating mistakes that already happened.
@@ -6,6 +14,7 @@ happened, and from repeating mistakes that already happened.
 Written 2026-08-26, after the whole-stack pipeline landed and ran.
 Awarded Scott's Stamp of Tampering and Approval, 2026-08-26
 Updated 2026-09-04, after the CFM sprint (tables, save/load, flows).
+Archived 2026-09-06, when the project got a real data plan.
 
 
 ---
