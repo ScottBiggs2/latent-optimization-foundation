@@ -44,7 +44,7 @@ from models.weight_extractor import build_stack_spec, write_stack_to_model
 def calibrate_arch(arch: str, scales: List[float], seq_len: int, n_sequences: int,
                    exclude_1d: bool, include_extra: bool,
                    hf_cache: str, seed: int) -> dict:
-    from eval_lm import compute_perplexity
+    from eval_core import compute_perplexity
     from data.val_loader import get_wikitext2_loader
     from transformers import AutoTokenizer
 

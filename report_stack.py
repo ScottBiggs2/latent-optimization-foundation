@@ -31,10 +31,20 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
-try:
-    from report import ARCH_DISPLAY_NAMES
-except Exception:      # report.py is optional; never let it break this script
-    ARCH_DISPLAY_NAMES = {}
+# Mirrors models/registry.py ARCH_CONFIGS default_model_id -- kept as a plain dict
+# here (rather than importing llmzoo.models.registry) so this script keeps ZERO heavy
+# imports. That property is enforced by test_stdlib_purity in tests/test_report.py and
+# is what lets this render on the `cpu` partition and on a laptop.
+ARCH_DISPLAY_NAMES = {
+    "gpt2_medium":   "openai-community/gpt2-medium",
+    "smollm2_360m":  "HuggingFaceTB/SmolLM2-360M",
+    "qwen3_0_6b":    "Qwen/Qwen3-0.6B",
+    "gemma3_270m":   "google/gemma-3-270m",
+    "opt_350m":      "facebook/opt-350m",
+    "smollm2_135m":  "HuggingFaceTB/SmolLM2-135M",
+    "pythia_160m":   "EleutherAI/pythia-160m",
+    "pythia_410m":   "EleutherAI/pythia-410m",
+}
 
 # Display order. Reconstruction arms first, then generative, then diagnostics --
 # reading left to right walks from "can the basis represent this" to "can we sample

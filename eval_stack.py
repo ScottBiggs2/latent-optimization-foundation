@@ -115,11 +115,9 @@ def stack_metrics(recon: np.ndarray, w0: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 # Multiple-choice benchmarks
 #
-# eval_mc.py is legacy-typed at the top level (BatchedCovariancePCA /
-# ConditionedBlockVAE / max_block_size), so nothing from it is reused except the two
-# model-agnostic primitives below. compute_mc_accuracy takes any nn.Module, which is
-# what lets the measurement sit inside the arm loop on a model that has just had a
-# reconstruction written into it.
+# The scoring primitives live in eval_core.py, which takes any nn.Module and knows
+# nothing about PCA / VAEs / bundles. That is what lets the measurement sit inside the
+# arm loop on a model that has just had a reconstruction written into it.
 # ---------------------------------------------------------------------------
 
 ALL_BENCHMARKS = ("mmlu", "hellaswag", "gpqa")
@@ -194,7 +192,7 @@ def load_bench_examples(benchmarks, n_questions: int, hf_cache: Optional[str],
 def measure_benchmarks(model, tokenizer, examples_by_bench: Dict[str, list],
                        device, max_length: int) -> Dict[str, dict]:
     """Score the model AS IT CURRENTLY IS. Returns {bench: {acc, acc_norm, n_examples}}."""
-    from eval_mc import compute_mc_accuracy
+    from eval_core import compute_mc_accuracy
     out: Dict[str, dict] = {}
     for name, examples in examples_by_bench.items():
         out[name] = compute_mc_accuracy(model, tokenizer, examples, device,
@@ -242,8 +240,7 @@ def evaluate_arch(
     flow_rt_steps: Optional[List[int]] = None,
     dispersion_n: int = 64,
 ) -> dict:
-    from eval_lm import compute_perplexity
-    from eval_mc import get_max_context_length
+    from eval_core import compute_perplexity, get_max_context_length
 
     ds = bundle.dataset
     pca = bundle.pcas.get(arch)
@@ -607,7 +604,7 @@ def main() -> None:
     p.add_argument("--bench_seed", type=int, default=0)
     p.add_argument("--bench_max_length", type=int, default=None,
                    help="Override the per-model context cap. Default: read from the "
-                        "model config via eval_mc.get_max_context_length.")
+                        "model config via eval_core.get_max_context_length.")
     p.add_argument("--dispersion_n", type=int, default=64,
                    help="Draws used to estimate each generative arm's code "
                         "dispersion (misstep 19). Costs microseconds -- the "

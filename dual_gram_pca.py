@@ -1,11 +1,12 @@
 """
 DualGramPCA — dual (Gram-matrix) PCA that never materialises the component basis.
 
-Relationship to dual_pca.BatchedCovariancePCA
----------------------------------------------
-`BatchedCovariancePCA` implements the same math but ends by building an explicit
-`(k, n_params)` component matrix. That is fine when a sample is one transformer block
-(k=97, D=15.7M -> 6.1 GB) and impossible when a sample is a whole decoder stack:
+Why the basis is never materialised
+----------------------------------
+The textbook formulation (and this repo's removed block-era `BatchedCovariancePCA`)
+implements the same math but ends by building an explicit `(k, n_params)` component
+matrix. That is fine when a sample is one transformer block (k=97, D=15.7M -> 6.1 GB)
+and impossible when a sample is a whole decoder stack:
 
     k=99, D=302M  ->  99 * 302e6 * 4 B = 119.6 GB   per architecture
 
@@ -62,7 +63,7 @@ worth knowing before reading a spectrum or a residual:
 Numerics
 --------
 The Gram is accumulated in float64 and the eigendecomposition uses `eigh` (C is
-symmetric), with a relative rank floor. See dual_pca.DEFAULT_RANK_RTOL for why the
+symmetric), with a relative rank floor. See DEFAULT_RANK_RTOL below for why the
 floor is where it is — briefly, forming C squares the condition number of the data,
 so eigenvalues below ~fp32 epsilon are roundoff whose eigenVECTORS are meaningless
 even when their magnitudes look plausible.
@@ -77,7 +78,20 @@ from typing import Optional
 import numpy as np
 import torch
 
-from dual_pca import DEFAULT_RANK_RTOL
+# Eigenvalues below DEFAULT_RANK_RTOL * max_eigenvalue are treated as numerical noise
+# and dropped.  This is not a knob to loosen casually.
+#
+# The dual trick forms C = Xc^T Xc, which squares the condition number: a singular
+# value ratio of r shows up as an eigenvalue ratio of r^2. Weights are extracted as
+# float32 (eps ~ 1.2e-7), so singular values below ~1e-4 of the leading one are already
+# at the input's noise level, which puts the corresponding EIGENVALUE floor at
+# ~1e-8..1e-7. 1e-7 is the conservative end of that range.
+#
+# Setting this lower does not recover more signal -- it admits eigenvectors whose
+# directions are pure roundoff, which then get normalised to unit length and given
+# equal footing with the real components in transform()/inverse_transform(). That was
+# the concrete failure mode of the old randomized_svd path.
+DEFAULT_RANK_RTOL = 1e-7
 
 GRAM_LAYOUT_VERSION = 1
 
