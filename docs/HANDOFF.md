@@ -1,6 +1,10 @@
 # Handoff — CFM sprint, 2026-08-31 → 2026-09-04
 
-Point a new session at this file, then at `RESEARCH_NOTES.md`.
+> **ARCHIVE.** Superseded by `RESEARCH_PLAN.md` (2026-09-06) for everything
+> forward-looking, and by the 2026-09-07 refactor for every file path below —
+> the block pipeline named here has been deleted and the tree is now
+> `src/llmzoo/` + `scripts/` + `slurm/`. Kept because §2 (what was learned) and
+> the run/job-ID record in §1 are not written down anywhere else.
 
 **One-line state:** the whole-stack pipeline now runs end to end — ensembles → per-family
 Gram PCA → `StackVAE` → conditional rectified flows → eight eval arms → markdown report,
@@ -142,9 +146,10 @@ ratio every print epoch, the final ratio is sealed into `flow_meta.json`, and
 
 1. **Rotate `HF_TOKEN`.** It was leaked into an assistant transcript on 2026-09-03 via
    `${HF_TOKEN:-UNSET}` (which expands to the *value* when set). Nothing depends on the
-   old value now. `slurm_stack_bench.sh` was fixed to print only the length.
-2. **Commit.** ~30 files are modified/untracked; nothing from this sprint is in git.
-   Remote repo is behind local.
+   old value now. `slurm/stack_bench.sbatch` prints only the length.
+   **STILL OUTSTANDING as of 2026-09-07.**
+2. ~~**Commit.** ~30 files are modified/untracked; nothing from this sprint is in
+   git.~~ **DONE** — commit `ea36ba1`, 2026-09-06.
 
 ### The actual next experiment
 

@@ -379,7 +379,7 @@ def main() -> None:
     k = args.k if args.k is not None else args.n_samples - 1
     vae_dir = os.path.join(run_root, f"vae_k{k}")
 
-    # name_suffix matters: slurm_stack_run.sh calls this script once per rank in a
+    # name_suffix matters: slurm/stack_run.sbatch calls this script once per rank in a
     # single job, and each call is its own process, so without it both runs land
     # under the identical name train_stack_<jobid>.
     wb.init_run(job_type="train_stack", config=vars(args),

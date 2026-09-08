@@ -49,7 +49,7 @@ def init_run(
 
     name_suffix
         Appended to the run name. One Slurm job routinely invokes the same
-        script several times -- slurm_stack_run.sh trains a VAE at k=N-1 and
+        script several times -- slurm/stack_run.sbatch trains a VAE at k=N-1 and
         again at k=N/2, and the flow scripts add two spaces on top of that --
         and each invocation is a separate process, so each opens its own W&B
         run. Without a suffix they all land under the identical name

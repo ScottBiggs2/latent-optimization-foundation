@@ -1,6 +1,6 @@
 # Research Plan — the LLM weight zoo
 
-Written 2026-09-06. Supersedes §4 and §7 of [RESEARCH_NOTES.md](RESEARCH_NOTES.md),
+Written 2026-09-06. Supersedes §4 and §7 of [docs/RESEARCH_NOTES.md](docs/RESEARCH_NOTES.md),
 which stays authoritative for the 21 recorded missteps (§5) and the environment
 facts (§6). Read this one first; read that one before you touch code.
 
@@ -61,10 +61,10 @@ regions of weight space." It is a premise. Nobody has measured it, including us 
 | ensembles → per-family Gram PCA → StackVAE → conditional rectified flow → 8 eval arms → report | runs end to end, versioned, fingerprinted, reloadable |
 | 348 automated checks across 5 modules | green |
 | a **null arm** (`gauss_codes`: `z ~ N(mean_f, std_f)`) | built, and it is the arm that decides whether any flow number means anything |
-| a **dispersion diagnostic** (`code_rms_ratio`, `diag_flow_dispersion.py`) | built; catches the failure that ΔPPL cannot see |
+| a **dispersion diagnostic** (`code_rms_ratio`, `scripts/diag_flow_dispersion.py`) | built; catches the failure that ΔPPL cannot see |
 | **bulk** spectrum statistics (`ev0/median`, effective-rank ratio) | sealed into every artifact |
 | a pre-registered null result on a manufactured ensemble | flow ≡ Gaussian to 0.015pp in all 6 cells, exactly as predicted |
-| 21 recorded missteps | RESEARCH_NOTES §5 |
+| 21 recorded missteps | docs/RESEARCH_NOTES.md §5 |
 | CFG on the velocity field **and** on the VAE decoder | two independent mechanisms, both wired |
 | whole-stack layout incl. embeddings + LM head | `ENSEMBLE_LAYOUT_VERSION = 2` |
 
@@ -291,7 +291,7 @@ accusation.
       a finding.
 
 If no samples survive, the re-run is the DWF repo's own generation scripts plus
-`diag_flow_dispersion.py`. Note the asymmetry: **this is a safe thing to find, because
+`scripts/diag_flow_dispersion.py`. Note the asymmetry: **this is a safe thing to find, because
 it is our own paper.** Us finding it is a contribution. Someone else finding it is a
 problem.
 
@@ -301,9 +301,9 @@ reason to prefer the shared trunk — but we should still know.
 
 ### 5.3 Consequence for this sprint
 
-**Do not replicate "let it rip."** `train_flow.py` now defaults to `--holdout_frac
+**Do not replicate "let it rip."** `scripts/train_flow.py` now defaults to `--holdout_frac
 0.15` (val gating), logs `--dispersion_n` every print epoch, seals the final ratio into
-`flow_meta.json`, and prints a loud block below 0.8. `slurm_flow_run.sh` defaults to
+`flow_meta.json`, and prints a loud block below 0.8. `slurm/flow_run.sbatch` defaults to
 (64,128,64) at 500 epochs. Keep all of it. The small net is not a compromise — at 51k
 parameters it is the *only* configuration in the sweep that disperses correctly.
 
@@ -315,7 +315,7 @@ parameters it is the *only* configuration in the sweep that disperses correctly.
 
 Correcting an earlier error in this plan. The flow's input width is `k`, and
 `k = N−1` is set by **ensemble size, which we choose**. Give gpt2, a Mamba/SSM and a
-dLLM N=100 members each and all three produce 99-dim codes. `train_flow.py` already
+dLLM N=100 members each and all three produce 99-dim codes. `scripts/train_flow.py` already
 reads `codes_k<k>/` as a stacked `(M, k)` array with `family_idxs` alongside, so a
 **joint multi-architecture flow needs no code changes at all.**
 
@@ -345,7 +345,7 @@ tractable multi-architecture experiments are:
 0.1 books]`. One architecture per basis, so cross-mixture transfer is arithmetic.
 
 The conditioning input must be **`π` itself**, through a small MLP — replacing
-`nn.Embedding(n_families, cond_dim)` at `flow.py:274`. ~15 lines.
+`nn.Embedding(n_families, cond_dim)` at `src/llmzoo/gen/flow.py:273`. ~15 lines.
 
 > **Why not interpolate learned embeddings.** With a discrete embedding table the only
 > way to reach a novel mixture is to blend rows (`0.5·e_code + 0.5·e_math`). That is
@@ -517,11 +517,11 @@ the field says it cares about.
 
 | # | item | depends on | est. |
 |---|---|---|---|
-| 1 | `train_zoo.py` (trunk + branch, sbatch array) + `source="zoo"` in `EnsembleDataset` | — | 1–2 d |
+| 1 | `scripts/train_zoo.py` (trunk + branch, sbatch array) + `source="zoo"` in `EnsembleDataset` | — | 1–2 d |
 | 2 | **Pilot: N=32 @ 50M, read the spectrum** (run §4.3b first) | 1 | ~1 GPU-hr |
 | 3 | **GO / NO-GO on §4.3** | 2 | — |
 | 4 | Zoo @ 100M, N=100, β sweep | 3 | ~15 GPU-hr |
-| 5 | Simplex conditioning: `π`-vector MLP replacing `nn.Embedding` (`flow.py:274`) | — (parallel) | 0.5 d |
+| 5 | Simplex conditioning: `π`-vector MLP replacing `nn.Embedding` (`src/llmzoo/gen/flow.py:273`) | — (parallel) | 0.5 d |
 | 6 | Flows, 8 arms, held-out mixtures + retrieval baseline (§6.3) | 4, 5 | 1 d |
 | 7 | **Per-domain slope figure** (§6.4) | 6 | 0.5 d |
 | 8 | Scaling points @ 50M and 250M | 4 | ~99 GPU-hr |

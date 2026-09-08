@@ -727,7 +727,7 @@ def main() -> None:
     os.makedirs(res_dir, exist_ok=True)
     # sample_idx and out_suffix are BOTH in the filename because the two axes are
     # independent: the all-arm dPPL job and the benchmark job are deliberately
-    # separate sbatch jobs (see slurm_stack_bench.sh's header on why), and at
+    # separate sbatch jobs (see slurm/stack_bench.sbatch's header on why), and at
     # sample_idx 0 they would otherwise write the same path and clobber each other.
     # report_stack.py globs stack_eval_results*.json and renders each as its own
     # section, so any suffix slots in without a code change.

@@ -27,6 +27,8 @@ env/
 # Large model / artifact directories — never commit these
 artifacts*/
 artifacts_local/
+results/
+runs/
 
 # HPC scratch outputs (local mirror if any)
 /scratch/
@@ -40,6 +42,12 @@ Thumbs.db
 .idea/
 *.swp
 
-# SLURM logs
+# SLURM logs (jobs write to /scratch/$USER/logs, but catch stray local ones)
 slurm_*.out
 slurm_*.err
+*.out
+*.err
+
+# Claude Code local state — machine-specific, and a stale scheduler lock lived
+# here dirtying `git status` for two months.
+.claude/
