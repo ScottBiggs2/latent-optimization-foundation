@@ -36,7 +36,6 @@ Gaussian. Either way, the measured spectrum is sealed into the checkpoint and
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import time
 from typing import Dict, Optional

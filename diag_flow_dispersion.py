@@ -27,7 +27,6 @@ import argparse
 import json
 import os
 
-import numpy as np
 import torch
 
 from run_bundle import load_run

@@ -31,9 +31,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from flow import (FLOW_LAYOUT_VERSION, CodeFlowSpace, FlowVelocityNet,
-                  LatentFlowSpace, RectifiedFlow, build_space, load_flow,
-                  save_flow, sinusoidal_time_embedding)
+from flow import (FLOW_LAYOUT_VERSION, FlowVelocityNet, RectifiedFlow,
+                  build_space, load_flow, save_flow,
+                  sinusoidal_time_embedding)
 from models.registry import N_FAMILIES
 from run_bundle import CodeStats
 from vae import StackVAE

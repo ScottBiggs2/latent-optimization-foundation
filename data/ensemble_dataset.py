@@ -1,13 +1,14 @@
 """
 EnsembleDataset — per-architecture ensembles of WHOLE decoder stacks.
 
-Why this exists (and how it differs from BlockDataset)
------------------------------------------------------
-BlockDataset treats **one transformer block** as one PCA sample, zero-pads every
-block to a shared `max_block_size`, and fits ONE basis over all families.
+Why this exists (and how it differs from the block layout it replaced)
+----------------------------------------------------------------------
+The removed block pipeline treated **one transformer block** as one PCA sample,
+zero-padded every block to a shared `max_block_size`, and fit ONE basis over all
+families.
 
-This module follows DeepWeightFlow (arXiv 2601.05052), which `dual_pca.py` is adapted
-from, where **one PCA sample is the final weight vector of one complete network**:
+This module follows DeepWeightFlow (arXiv 2601.05052), where **one PCA sample is the
+final weight vector of one complete network**:
 
     sample  = the whole network, flattened  (D_f = extra + n_layers x block_size)
     N       = the number of complete models in the ensemble
@@ -18,7 +19,7 @@ Two consequences worth stating, because they are why this layout was chosen:
 
   * **Zero padding.** Every family has uniform block sizes (verified on real
     configs), so a stack is a fixed length and no mask is needed anywhere.
-  * **Conditioning stops being a primary key.** BlockDataset gave every block a
+  * **Conditioning stops being a primary key.** The block layout gave every block a
     unique `(family_idx, block_idx)`, so a conditioned decoder could memorise the
     whole training set and ignore z — the measured cause of the 0.001 nats/sample
     posterior collapse. Here N samples share one `family_idx`, so it cannot.

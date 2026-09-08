@@ -357,7 +357,7 @@ def test_real_ensemble_dataset() -> None:
 
 def test_extra_segment() -> None:
     print("\n--- extra segment (embeddings / final norm / LM head) ---")
-    from models.registry import build_tiny_model, get_arch_config, get_layers
+    from models.registry import build_tiny_model, get_arch_config
     from models.weight_extractor import (
         build_stack_spec, extract_extra_flat, read_stack_from_model,
         write_stack_to_model,

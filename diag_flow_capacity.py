@@ -30,7 +30,6 @@ import json
 import os
 from typing import List, Tuple
 
-import numpy as np
 import torch
 
 from flow import FlowVelocityNet, RectifiedFlow, build_space

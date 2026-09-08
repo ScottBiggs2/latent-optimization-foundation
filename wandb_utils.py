@@ -1,6 +1,6 @@
 """
-Thin Weights & Biases integration, shared by train.py / run_hpc.py /
-eval_baseline.py / eval_mc.py.
+Thin Weights & Biases integration, shared by every training and evaluation
+entry point.
 
 Degrades to a no-op if wandb isn't installed or logging is disabled
 (--no_wandb), so nothing in the pipeline ever depends on it to run.
@@ -10,7 +10,7 @@ Usage
 Each standalone entrypoint's main() calls init_run() once; shared stage
 functions (train_vae, evaluate_family, evaluate_family_mc, ...) just call
 log() unconditionally — it no-ops if no run is active, so those functions
-work the same whether invoked standalone or from run_hpc.py's orchestration.
+work the same whether invoked standalone or from a multi-stage sbatch chain.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def init_run(
 ) -> bool:
     """
     Start a W&B run. No-ops (returns False) if wandb is missing, disabled,
-    or a run is already active in this process (e.g. run_hpc.py already
+    or a run is already active in this process (e.g. an orchestrator already
     opened one before calling into train.py's stage functions).
 
     name_suffix

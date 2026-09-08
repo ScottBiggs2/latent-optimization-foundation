@@ -29,8 +29,8 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 
 # Added: SmolLM2-135M, Pythia-160M, Pythia-410M (see below). Gemma 3 270M's
-# HF_TOKEN gating is exercised via run_hpc.py's default arch_list now instead
-# of being deferred indefinitely. OPT-350M stays registered but excluded from
+# HF_TOKEN gating is exercised via the default arch_list now instead of being
+# deferred indefinitely. OPT-350M stays registered but excluded from
 # the default arch_list (see its entry below).
 # Other future candidates? Olmo-2 checkpoint series (see README improvement plan).
 
@@ -119,7 +119,7 @@ ARCH_CONFIGS: dict[str, dict] = {
     #     # Access: https://huggingface.co/google/gemma-3-270m
     #     # Disabled: gated, requires a fresh HF_TOKEN export before every
     #     # sbatch — cut for now to simplify launching. To re-enable: set
-    #     # HF_TOKEN and add back to run_hpc.py's --arch_list.
+    #     # HF_TOKEN and add back to ARCH_LIST in the sbatch script.
     #     "default_model_id": "google/gemma-3-270m",
     #     "hf_model_type":    "gemma3_text",
     #     "layers_attr":      "model.layers",

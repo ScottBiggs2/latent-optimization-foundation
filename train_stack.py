@@ -22,7 +22,7 @@ import argparse
 import json
 import os
 import time
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import torch
@@ -424,7 +424,7 @@ def main() -> None:
         provenance_block(args.run_name, k, ens_fp, pca_fps))
     print(f"  code matrix: {tuple(codes.shape)} across {len(set(arch_of_row))} families")
 
-    vae = train_vae(
+    train_vae(
         args, codes, fidxs, code_stats, vae_dir,
         provenance_block(args.run_name, k, ens_fp, pca_fps,
                          code_stats_fp=code_stats.fingerprint()))

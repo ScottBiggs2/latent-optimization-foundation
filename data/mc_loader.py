@@ -2,7 +2,7 @@
 Multiple-choice benchmark loaders for downstream LM evaluation.
 
 Each loader returns a list of MCExample — a (context, choices, gold_idx)
-triple — built for log-likelihood scoring (see eval_mc.score_choices).
+triple — built for log-likelihood scoring (see eval_core.score_choices).
 No chat templates are used: all four registered architectures are base
 pretrained models, so scoring follows the standard lm-eval-harness-style
 protocol of ranking answer continuations by log-likelihood under the model.

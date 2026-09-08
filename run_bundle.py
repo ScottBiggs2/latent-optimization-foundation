@@ -42,7 +42,6 @@ update costs nothing -- `rebuild_manifest()` re-derives it by scanning -- and
 from __future__ import annotations
 
 import glob
-import json
 import os
 import re
 from dataclasses import dataclass, field
