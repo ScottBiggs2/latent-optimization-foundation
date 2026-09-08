@@ -1,13 +1,13 @@
 """
-Step 3 validation: EnsembleDataset + DualGramPCA.
+EnsembleDataset + DualGramPCA.
 
 The DualGramPCA checks use a small stand-in ensemble whose full data matrix fits in
 memory, so every result can be compared against an explicit brute-force PCA. That is
 the whole point: DualGramPCA never builds the (k, D) basis, so its correctness has to
 be pinned against a reference that does.
 
-    python tests_step3_ensemble.py            # math only, no model downloads
-    python tests_step3_ensemble.py --tiny     # also exercise real EnsembleDataset
+    python tests/test_ensemble.py            # math only, no model downloads
+    python tests/test_ensemble.py --tiny     # also exercise real EnsembleDataset
 """
 
 from __future__ import annotations

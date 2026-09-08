@@ -1,5 +1,5 @@
 """
-Step 5 validation: the conditional rectified flow, both spaces, and its persistence.
+The conditional rectified flow, both spaces, and its persistence.
 
 Everything here runs on CPU with no downloads and no real models. Three groups:
 
@@ -13,9 +13,9 @@ Everything here runs on CPU with no downloads and no real models. Three groups:
     not hold on a randomly-initialised field, the diagnostic cannot separate solver
     error from model inconsistency and `--flow_rt_steps` is meaningless.
   * PERSISTENCE -- a sealed flow must reproduce seeded samples exactly, in both
-    spaces, or refuse. Same contract as tests_step4, same reasoning (misstep 17).
+    spaces, or refuse. Same contract as tests/test_bundle.py, same reasoning (misstep 17).
 
-    python tests_step5_flow.py
+    python tests/test_flow.py
 """
 
 from __future__ import annotations

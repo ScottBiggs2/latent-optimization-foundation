@@ -1,17 +1,17 @@
 """
-Step 6 validation: report_stack.py renders the real schema, and refuses the wrong one.
+report_stack.py renders the real schema, and refuses the wrong one.
 
-Pure stdlib -- no numpy, no torch, no downloads -- so this runs on the `short`
-partition, and also locally against files copied down from Explorer. That purity is
-a property of report_stack.py worth protecting, so this file imports nothing heavy
-either.
+Pure stdlib -- no numpy, no torch, no downloads -- so this runs on the `cpu`
+partition, and also locally against files copied down from the cluster. That purity
+is a property of report_stack.py worth protecting, so this file imports nothing heavy
+either. It is the only test in this suite that can run on a laptop.
 
 The subject is misreading, not formatting. A reporting script that renders a legacy
 flat-schema file as a table of blanks, or that omits the `sample_idx = 0` warning,
 produces something that LOOKS like a result and is not one. Every `caveats()` check
 below corresponds to a recorded misstep (9, 12, 14, 15b) that already cost time.
 
-    python tests_step6_report_stack.py
+    python tests/test_report.py
 """
 
 from __future__ import annotations
@@ -23,7 +23,12 @@ import sys
 import tempfile
 from typing import List
 
-import report_stack as rs
+# report_stack.py is a CLI in scripts/, deliberately NOT part of the llmzoo package:
+# importing it must not pull the package in, or the stdlib-purity property below
+# would depend on llmzoo/__init__.py staying empty forever.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                os.pardir, "scripts"))
+import report_stack as rs                                        # noqa: E402
 
 FAILS: List[str] = []
 
@@ -508,13 +513,12 @@ def test_header_and_cli() -> None:
 
 
 def test_stdlib_purity() -> None:
-    print("\n--- stdlib purity (so this runs on `short`, and locally) ---")
-    # report_stack.py must never grow a numpy/torch import: that would break both
-    # the `short`-partition test and rendering locally from copied-down files.
+    print("\n--- stdlib purity (so this runs on `cpu`, and locally) ---")
+    # report_stack.py must never grow a numpy/torch/llmzoo import: that would break
+    # both the `cpu`-partition test and rendering locally from copied-down files.
     src = open(os.path.join(os.path.dirname(os.path.abspath(rs.__file__)),
                             "report_stack.py")).read()
-    for mod in ("numpy", "torch", "run_bundle", "ensemble_dataset",
-                "dual_gram_pca", "transformers"):
+    for mod in ("numpy", "torch", "transformers", "llmzoo"):
         check(f"report_stack.py does not import {mod}",
               f"import {mod}" not in src)
     check("sys.modules has no torch after importing report_stack",

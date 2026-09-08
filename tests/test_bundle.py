@@ -1,12 +1,12 @@
 """
-Step 4 validation: artifact_io fingerprints, CodeStats, StackVAE save/load, manifest.
+Artifact fingerprints, CodeStats, StackVAE save/load, manifest rebuild.
 
 Everything here runs on CPU with no downloads and no real models. The subject is the
 PERSISTENCE contract, not numerics: a checkpoint must either reload into a state that
 is bit-identical to what was saved, or refuse. Every refusal below corresponds to a
 way this repo has already been bitten (RESEARCH_NOTES missteps 3, 10, 16, 17).
 
-    python tests_step4_run_bundle.py
+    python tests/test_bundle.py
 """
 
 from __future__ import annotations
