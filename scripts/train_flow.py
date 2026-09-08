@@ -29,8 +29,8 @@ ensemble so a flat-spectrum run refuses instead of burning GPU-hours fitting a
 Gaussian. Either way, the measured spectrum is sealed into the checkpoint and
 `eval_stack`'s `gauss_codes` arm is the null model to compare against.
 
-    python train_flow.py --run_name perfam --k 99 --space codes
-    python train_flow.py --run_name perfam --k 99 --space latent
+    python scripts/train_flow.py --run_name perfam --k 99 --space codes
+    python scripts/train_flow.py --run_name perfam --k 99 --space latent
 """
 
 from __future__ import annotations
@@ -45,13 +45,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from artifact_io import (
+from llmzoo.artifacts.io import (
     ensemble_fingerprint, pca_fingerprint, provenance_block, read_json,
 )
-from flow import FlowVelocityNet, RectifiedFlow, build_space, save_flow
-from models.registry import N_FAMILIES
-from run_bundle import load_run, update_manifest_section
-import wandb_utils as wb
+from llmzoo.gen.flow import FlowVelocityNet, RectifiedFlow, build_space, save_flow
+from llmzoo.models.registry import N_FAMILIES
+from llmzoo.artifacts.bundle import load_run, update_manifest_section
+import llmzoo.wandb_utils as wb
 
 
 def ts() -> str:

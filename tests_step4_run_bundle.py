@@ -21,9 +21,9 @@ from typing import List
 import numpy as np
 import torch
 
-import artifact_io as aio
-from run_bundle import CodeStats, rebuild_manifest, update_manifest_section
-from vae import VAE_LAYOUT_VERSION, StackVAE
+import llmzoo.artifacts.io as aio
+from llmzoo.artifacts.bundle import CodeStats, rebuild_manifest, update_manifest_section
+from llmzoo.gen.vae import VAE_LAYOUT_VERSION, StackVAE
 
 FAILS: List[str] = []
 

@@ -18,7 +18,7 @@ So measure dispersion in code space, where it is cheap and unambiguous. No ensem
 no PCA, no inverse_transform -- this reads the 40 KB codes artifact and the sealed
 flows.
 
-    python diag_flow_dispersion.py --run_name emb3 --k 99
+    python scripts/diag_flow_dispersion.py --run_name emb3 --k 99
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import os
 
 import torch
 
-from run_bundle import load_run
+from llmzoo.artifacts.bundle import load_run
 
 
 def stats(x: torch.Tensor, name: str) -> dict:

@@ -15,7 +15,7 @@ into every evaluation run.
 
 All three benchmarks (MMLU / HellaSwag / GPQA) are scored with the same
 log-likelihood ranking primitive: no chat templates, since every registered
-architecture is a base pretrained model. See data/mc_loader.py for the
+architecture is a base pretrained model. See llmzoo/data/mc_loader.py for the
 per-benchmark prompt construction.
 """
 
@@ -27,7 +27,7 @@ from typing import Iterable, Tuple
 import torch
 import torch.nn as nn
 
-from data.mc_loader import MCExample
+from llmzoo.data.mc_loader import MCExample
 
 
 # ---------------------------------------------------------------------------

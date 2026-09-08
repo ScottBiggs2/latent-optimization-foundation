@@ -12,8 +12,8 @@ Stage 2 fits at the maximum rank ONCE. Lower-rank arms are a column prefix of th
 same fit -- components are variance-ordered and orthogonal, so a k-prefix IS the
 rank-k PCA. That makes the whole k sweep free after one fit.
 
-    python train_stack.py --k 99 --n_samples 100 --noise_scale 1e-2
-    python train_stack.py --k 50            # reuses the Stage 2 fits
+    python scripts/train_stack.py --k 99 --n_samples 100 --noise_scale 1e-2
+    python scripts/train_stack.py --k 50            # reuses the Stage 2 fits
 """
 
 from __future__ import annotations
@@ -29,15 +29,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from artifact_io import (
+from llmzoo.artifacts.io import (
     ensemble_fingerprint, pca_fingerprint, provenance_block, read_json,
 )
-from data.ensemble_dataset import EnsembleDataset
-from dual_gram_pca import DualGramPCA
-from models.registry import N_FAMILIES
-from run_bundle import CodeStats, rebuild_manifest
-from vae import BetaScheduler, StackVAE
-import wandb_utils as wb
+from llmzoo.data.ensemble import EnsembleDataset
+from llmzoo.pca.gram import DualGramPCA
+from llmzoo.models.registry import N_FAMILIES
+from llmzoo.artifacts.bundle import CodeStats, rebuild_manifest
+from llmzoo.gen.vae import BetaScheduler, StackVAE
+import llmzoo.wandb_utils as wb
 
 
 def ts() -> str:

@@ -22,7 +22,7 @@ says: embeddings sit directly on the logit path, and where the LM head is untied
 (pythia) a quarter of the stack is logit-facing. Re-run this whenever the layout
 changes.
 
-    python calibrate_noise.py --arch_list gpt2_medium smollm2_360m pythia_410m \
+    python scripts/calibrate_noise.py --arch_list gpt2_medium smollm2_360m pythia_410m \
         --scales 1e-4 1e-3 3e-3 1e-2 3e-2
 """
 
@@ -37,15 +37,15 @@ from typing import List
 import numpy as np
 import torch
 
-from models.registry import get_arch_config, load_model
-from models.weight_extractor import build_stack_spec, write_stack_to_model
+from llmzoo.models.registry import get_arch_config, load_model
+from llmzoo.models.weight_extractor import build_stack_spec, write_stack_to_model
 
 
 def calibrate_arch(arch: str, scales: List[float], seq_len: int, n_sequences: int,
                    exclude_1d: bool, include_extra: bool,
                    hf_cache: str, seed: int) -> dict:
-    from eval_core import compute_perplexity
-    from data.val_loader import get_wikitext2_loader
+    from llmzoo.eval.core import compute_perplexity
+    from llmzoo.data.val_loader import get_wikitext2_loader
     from transformers import AutoTokenizer
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

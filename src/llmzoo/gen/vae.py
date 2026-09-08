@@ -49,8 +49,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from artifact_io import require_version
-from models.registry import N_FAMILIES
+from llmzoo.artifacts.io import require_version
+from llmzoo.models.registry import N_FAMILIES
 
 # Bumped whenever the on-disk layout under vae_k<k>/ changes.
 #   1 : vae_meta.json + vae_weights.pt, with provenance binding the checkpoint to

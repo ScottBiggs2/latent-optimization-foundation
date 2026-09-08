@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmzoo"
+version = "0.1.0"
+description = "Generative modelling over the weights of a zoo of language models"
+requires-python = ">=3.11"
+
+# torch is deliberately ABSENT.
+#
+# AICR's B200s are sm_100 (Blackwell) and need a cu128 build, which does not live
+# on the default PyPI index. If torch were listed here, `pip install -e .` could
+# silently pull a default-index wheel over the cu128 one already installed and the
+# failure would not surface until a job hit the first CUDA kernel.
+#
+# slurm/setup_env_aicr.sh installs torch from download.pytorch.org/whl/cu128
+# FIRST, then runs `pip install -e .` for everything below.
+dependencies = [
+    "numpy>=1.23.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.2.0",
+    "transformers>=4.40.0",
+    "accelerate>=0.27.0",
+    "huggingface-hub>=0.20.0",
+    "datasets>=2.14.0",
+    "tqdm>=4.65.0",
+    "wandb>=0.17.0",
+]
+
+[project.optional-dependencies]
+dev = ["pyflakes"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

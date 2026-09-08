@@ -19,7 +19,7 @@ Design: hold k, the code matrix, the seed and the space FIXED; sweep only net wi
 and epochs. Trains in-process and writes NO artifacts, so the sealed flows of the run
 being studied are untouched.
 
-    python diag_flow_capacity.py --run_name emb3 --k 99
+    python scripts/diag_flow_capacity.py --run_name emb3 --k 99
 """
 
 from __future__ import annotations
@@ -32,9 +32,9 @@ from typing import List, Tuple
 
 import torch
 
-from flow import FlowVelocityNet, RectifiedFlow, build_space
-from models.registry import N_FAMILIES
-from run_bundle import load_run
+from llmzoo.gen.flow import FlowVelocityNet, RectifiedFlow, build_space
+from llmzoo.models.registry import N_FAMILIES
+from llmzoo.artifacts.bundle import load_run
 
 
 def train_one(codes: torch.Tensor, fidx: torch.Tensor, space, dim: int,

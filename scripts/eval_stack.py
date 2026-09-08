@@ -31,9 +31,9 @@ between write-back and restore, so each arm pays one model load rather than one 
 benchmark. It is opt-in because it is the expensive axis: 3 benchmarks x 200
 questions x 4 choices is ~2,400 forward passes PER ARM PER ARCH PER RANK.
 
-    python eval_stack.py --run_name perfam --k 99 50
-    python eval_stack.py --run_name perfam --k 50 --arms pca_only vae generate
-    python eval_stack.py --run_name perfam --arms pca_only vae --bench
+    python scripts/eval_stack.py --run_name perfam --k 99 50
+    python scripts/eval_stack.py --run_name perfam --k 50 --arms pca_only vae generate
+    python scripts/eval_stack.py --run_name perfam --arms pca_only vae --bench
 """
 
 from __future__ import annotations
@@ -47,13 +47,13 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from artifact_io import read_json
-from models.registry import get_arch_config, load_model, build_tiny_model
-from models.weight_extractor import (
+from llmzoo.artifacts.io import read_json
+from llmzoo.models.registry import get_arch_config, load_model, build_tiny_model
+from llmzoo.models.weight_extractor import (
     read_stack_from_model, write_stack_to_model,
 )
-from run_bundle import load_run
-import wandb_utils as wb
+from llmzoo.artifacts.bundle import load_run
+import llmzoo.wandb_utils as wb
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ def flow_spaces_for(arms) -> tuple:
 # ---------------------------------------------------------------------------
 # Metrics
 #
-# write_stack_to_model / read_stack_from_model live in models/weight_extractor.py
+# write_stack_to_model / read_stack_from_model live in llmzoo/models/weight_extractor.py
 # so the flow sampler and the benchmark path can reuse them without importing an
 # eval script.
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ def _synthetic_examples(n_questions: int, seed: int) -> list:
     with no download and no meaning.
     """
     import random
-    from data.mc_loader import MCExample
+    from llmzoo.data.mc_loader import MCExample
     rng = random.Random(seed)
     vocab = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
     out = []
@@ -177,7 +177,7 @@ def load_bench_examples(benchmarks, n_questions: int, hf_cache: Optional[str],
     Called from main(), not from evaluate_arch: the questions do not depend on arch
     or rank, so loading them per-arch would re-read the datasets 6+ times.
     """
-    from data.mc_loader import LOADERS
+    from llmzoo.data.mc_loader import LOADERS
     out: Dict[str, list] = {}
     for name in benchmarks:
         if name == "synthetic":
@@ -192,7 +192,7 @@ def load_bench_examples(benchmarks, n_questions: int, hf_cache: Optional[str],
 def measure_benchmarks(model, tokenizer, examples_by_bench: Dict[str, list],
                        device, max_length: int) -> Dict[str, dict]:
     """Score the model AS IT CURRENTLY IS. Returns {bench: {acc, acc_norm, n_examples}}."""
-    from eval_core import compute_mc_accuracy
+    from llmzoo.eval.core import compute_mc_accuracy
     out: Dict[str, dict] = {}
     for name, examples in examples_by_bench.items():
         out[name] = compute_mc_accuracy(model, tokenizer, examples, device,
@@ -240,7 +240,7 @@ def evaluate_arch(
     flow_rt_steps: Optional[List[int]] = None,
     dispersion_n: int = 64,
 ) -> dict:
-    from eval_core import compute_perplexity, get_max_context_length
+    from llmzoo.eval.core import compute_perplexity, get_max_context_length
 
     ds = bundle.dataset
     pca = bundle.pcas.get(arch)
@@ -254,7 +254,7 @@ def evaluate_arch(
 
     tok = None
     if mode == "tiny":
-        from data.val_loader import get_synthetic_loader
+        from llmzoo.data.val_loader import get_synthetic_loader
         vocab = cfg["tiny_config"].get("vocab_size",
                                        cfg["tiny_config"].get("n_positions", 1000))
         loader = get_synthetic_loader(vocab_size=vocab, seq_len=seq_len,
@@ -264,7 +264,7 @@ def evaluate_arch(
             # CUDA device-side assert in the embedding lookup.
             tok = _SyntheticTokenizer(vocab)
     else:
-        from data.val_loader import get_wikitext2_loader
+        from llmzoo.data.val_loader import get_wikitext2_loader
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(cfg["default_model_id"],
                                             cache_dir=hf_cache,

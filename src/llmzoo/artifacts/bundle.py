@@ -49,7 +49,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from artifact_io import (
+from llmzoo.artifacts.io import (
     CODE_STATS_VERSION, MANIFEST_VERSION, atomic_write_json, ensemble_fingerprint,
     fingerprint, git_commit, pca_fingerprint, read_json, require_version,
 )
@@ -360,7 +360,7 @@ def load_run(
     # cache gate refuses a mismatch, so this guarantees inverse_transform streams
     # the same ensemble the PCA was fit on.
     if "dataset" in want:
-        from data.ensemble_dataset import EnsembleDataset
+        from llmzoo.data.ensemble import EnsembleDataset
         bundle.dataset = EnsembleDataset(
             arch_list=archs,
             n_samples=ens_meta["n_samples"],
@@ -376,7 +376,7 @@ def load_run(
     # --- per-family PCA ---------------------------------------------------
     pca_fps: Dict[str, str] = {}
     if "pca" in want:
-        from dual_gram_pca import DualGramPCA
+        from llmzoo.pca.gram import DualGramPCA
         for arch in archs:
             d = os.path.join(run_root, "pca", arch)
             bundle.pcas[arch] = DualGramPCA.load(d, device=device)
@@ -405,7 +405,7 @@ def load_run(
 
     # --- VAE --------------------------------------------------------------
     if "vae" in want:
-        from vae import StackVAE
+        from llmzoo.gen.vae import StackVAE
         vdir = os.path.join(run_root, f"vae_k{bundle.k}")
         if os.path.exists(os.path.join(vdir, "vae_meta.json")) or \
                 (allow_legacy_vae and
@@ -426,7 +426,7 @@ def load_run(
 
     # --- flows ------------------------------------------------------------
     if "flow" in want:
-        from flow import load_flow
+        from llmzoo.gen.flow import load_flow
         for space in flow_spaces:
             fdir = os.path.join(run_root, f"flow_k{bundle.k}_{space}")
             if not os.path.exists(os.path.join(fdir, "flow_meta.json")):

@@ -60,10 +60,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from models.registry import (
+from llmzoo.models.registry import (
     build_tiny_model, get_arch_config, get_layers, list_archs, load_model,
 )
-from models.weight_extractor import (
+from llmzoo.models.weight_extractor import (
     ParamEntry, extract_block_flat, extract_extra_flat,
 )
 

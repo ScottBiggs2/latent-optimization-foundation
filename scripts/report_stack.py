@@ -17,9 +17,9 @@ Why this is a separate file from report.py
 
 The one thing shared is the display-name table, imported read-only.
 
-    python report_stack.py --run_dir ./runs/perfam
-    python report_stack.py --results ./stack_eval_results_s5.json -o report.md
-    python report_stack.py --run_dir ./runs/perfam --inspect
+    python scripts/report_stack.py --run_dir ./runs/perfam
+    python scripts/report_stack.py --results ./stack_eval_results_s5.json -o report.md
+    python scripts/report_stack.py --run_dir ./runs/perfam --inspect
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
-# Mirrors models/registry.py ARCH_CONFIGS default_model_id -- kept as a plain dict
+# Mirrors llmzoo/models/registry.py ARCH_CONFIGS default_model_id -- a plain dict
 # here (rather than importing llmzoo.models.registry) so this script keeps ZERO heavy
 # imports. That property is enforced by test_stdlib_purity in tests/test_report.py and
 # is what lets this render on the `cpu` partition and on a laptop.

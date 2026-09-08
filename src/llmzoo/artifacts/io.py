@@ -2,8 +2,8 @@
 Shared artifact primitives: version gates, fingerprints, atomic JSON, provenance.
 
 This is a LEAF module. It imports nothing from this repo, deliberately: `vae.py`,
-`flow.py` and `run_bundle.py` all need these helpers, and `run_bundle.py` needs
-`vae.py` and `flow.py`, so putting the helpers in `run_bundle.py` would be an
+`gen/flow.py` and `artifacts/bundle.py` all need these helpers, and `bundle.py` needs
+`gen/vae.py` and `gen/flow.py`, so putting the helpers in `bundle.py` would be an
 import cycle.
 
 Why any of this exists

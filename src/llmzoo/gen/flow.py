@@ -53,8 +53,8 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from artifact_io import require_version
-from models.registry import N_FAMILIES
+from llmzoo.artifacts.io import require_version
+from llmzoo.models.registry import N_FAMILIES
 
 # Bumped whenever the on-disk layout under flow_k<k>_<space>/ changes.
 FLOW_LAYOUT_VERSION = 1

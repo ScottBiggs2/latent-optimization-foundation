@@ -60,7 +60,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .registry import get_arch_config, get_layers
+from llmzoo.models.registry import get_arch_config, get_layers
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ def reconstruct_block(
 #
 # A whole-stack sample is  [extra | block_0 ... block_{L-1}].  Everything below
 # operates on that layout.  `spec` is duck-typed rather than imported so this
-# module stays a leaf: data/ensemble_dataset.py imports FROM here, and its
+# module stays a leaf: llmzoo/data/ensemble.py imports FROM here, and its
 # ArchStack is what gets passed in.  Required attributes:
 #
 #     n_layers, block_size, extra_size, schema, extra_schema

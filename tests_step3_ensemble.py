@@ -23,7 +23,7 @@ from typing import List, Tuple
 import numpy as np
 import torch
 
-from dual_gram_pca import DualGramPCA
+from llmzoo.pca.gram import DualGramPCA
 
 FAILS: List[str] = []
 
@@ -265,7 +265,7 @@ def test_noise_ensemble_analytic() -> None:
 
 def test_real_ensemble_dataset() -> None:
     print("\n--- EnsembleDataset (tiny mode) ---")
-    from data.ensemble_dataset import EnsembleDataset
+    from llmzoo.data.ensemble import EnsembleDataset
 
     tmp = tempfile.mkdtemp()
     try:
@@ -357,8 +357,8 @@ def test_real_ensemble_dataset() -> None:
 
 def test_extra_segment() -> None:
     print("\n--- extra segment (embeddings / final norm / LM head) ---")
-    from models.registry import build_tiny_model, get_arch_config
-    from models.weight_extractor import (
+    from llmzoo.models.registry import build_tiny_model, get_arch_config
+    from llmzoo.models.weight_extractor import (
         build_stack_spec, extract_extra_flat, read_stack_from_model,
         write_stack_to_model,
     )
@@ -432,8 +432,8 @@ def test_tied_lm_head() -> None:
     """
     print("\n--- tied LM head ---")
     from transformers import AutoConfig, AutoModelForCausalLM
-    from models.registry import get_arch_config
-    from models.weight_extractor import build_stack_spec
+    from llmzoo.models.registry import get_arch_config
+    from llmzoo.models.weight_extractor import build_stack_spec
 
     arch = "gpt2_medium"
     cfg = get_arch_config(arch)
