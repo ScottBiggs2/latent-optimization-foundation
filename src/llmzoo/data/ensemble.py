@@ -76,6 +76,11 @@ ENSEMBLE_LAYOUT_VERSION = 2
 # ensemble comfortably inside a 32 GB GPU alongside the Gram accumulator.
 DEFAULT_CHUNK_BUDGET_BYTES = 512 * 1024 * 1024
 
+# slurm/aicr_env.sh exports ARTIFACT_DIR (project space, persistent). The local
+# fallback keeps a bare `python scripts/train_stack.py` from writing to somebody
+# else's scratch path.
+DEFAULT_ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", "./artifacts")
+
 # Chunks below this many elements re-read filesystem pages and stop saturating the
 # GPU on the RNG call; above it, larger is only marginally better.
 MIN_CHUNK_ELEMS = 262_144
@@ -143,7 +148,7 @@ class EnsembleDataset:
         exclude_1d: bool = True,
         include_extra: bool = True,
         mode: str = "full",
-        artifact_dir: str = "/scratch/biggs.s/llm_vae",
+        artifact_dir: str = DEFAULT_ARTIFACT_DIR,
         seed: int = 42,
         chunk_budget_bytes: int = DEFAULT_CHUNK_BUDGET_BYTES,
         force_extract: bool = False,

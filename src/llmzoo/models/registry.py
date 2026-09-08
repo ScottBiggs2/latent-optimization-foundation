@@ -77,7 +77,7 @@ ARCH_CONFIGS: dict[str, dict] = {
     },
 
     "qwen3_0_6b": {
-        # Qwen3-0.6B — open weights, already cached on Explorer HPC.
+        # Qwen3-0.6B — open weights, no token needed.
         # LLaMA-style decoder; identical layer layout to smollm2_360m.
         # Replaces gemma3_270m at family_idx=2 (Gemma 3 is gated and requires
         # a HF_TOKEN + access approval; kept below as "gemma3_270m" for future use).
@@ -267,7 +267,9 @@ def load_model(
     cfg = get_arch_config(arch)
     mid = model_id or cfg["default_model_id"]
     hf_token = token or os.environ.get("HF_TOKEN")
-    hf_cache = cache_dir or os.environ.get("HF_HOME", "/scratch/biggs.s/hf_cache")
+    # None lets huggingface_hub fall back to its own default; the sbatch scripts
+    # export HF_HOME to scratch so a job never caches into $HOME.
+    hf_cache = cache_dir or os.environ.get("HF_HOME")
 
     print(f"Loading {mid} (arch={arch}, dtype={dtype}) …")
     model = AutoModelForCausalLM.from_pretrained(

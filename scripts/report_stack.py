@@ -11,7 +11,7 @@ Why this is a separate file from report.py
    pivoted before it can be tabulated. Sharing a formatter would mean branching on
    schema at every level.
 3. `report.py` is stdlib-pure so it runs locally against files copied down from
-   Explorer. This file keeps that property, which is why it reads the results JSON
+   the cluster. This file keeps that property, which is why it reads the results JSON
    and the manifest directly and NEVER calls run_bundle.load_run -- constructing an
    EnsembleDataset creates directories, so load_run is not a pure read.
 

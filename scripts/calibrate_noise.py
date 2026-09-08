@@ -121,7 +121,10 @@ def main() -> None:
     p.add_argument("--no_include_extra", dest="include_extra",
                    action="store_false")
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--artifact_dir", default="/scratch/biggs.s/llm_vae")
+    p.add_argument("--artifact_dir",
+                   default=os.environ.get("ARTIFACT_DIR", "./artifacts"),
+                   help="Run artifacts root. slurm/aicr_env.sh exports "
+                        "ARTIFACT_DIR; this flag overrides it.")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 

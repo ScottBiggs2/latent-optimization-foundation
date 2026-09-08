@@ -1,11 +1,9 @@
 #!/bin/bash
-# slurm_stack_run.sh
-#
 # Full whole-stack run: per-family Gram PCA -> StackVAE -> evaluation, at both
 # rank arms. One PCA sample is one complete decoder stack (DeepWeightFlow framing).
 #
-#   sbatch slurm_stack_run.sh
-#   N_SAMPLES=143 NOISE_SCALE=3e-3 RUN=perfam-s3e3 sbatch slurm_stack_run.sh
+#   sbatch slurm/stack_run.sbatch
+#   N_SAMPLES=143 NOISE_SCALE=3e-3 RUN=perfam-s3e3 sbatch slurm/stack_run.sbatch
 #
 # noise_scale=3e-3 is CALIBRATED on the CURRENT layout -- embeddings, final norm and
 # the untied LM head are all in D (job 9894023, WikiText-2 64x1024):
@@ -42,25 +40,30 @@
 # axis has to be read on a nonzero --sample_idx. At k=N-1 reconstruction is exact by
 # the rank bound (cosine 1.0, dPPL ~0); anything else there is a bug, not a finding.
 
-#SBATCH --job-name=llm_vae_stack
-#SBATCH --output=/scratch/biggs.s/llm_vae/logs/stack_%j.out
-#SBATCH --error=/scratch/biggs.s/llm_vae/logs/stack_%j.err
-#SBATCH --chdir=/home/biggs.s/llm_vae
-#SBATCH --partition=gpu
+#SBATCH --job-name=stack_run
+#SBATCH --account=p2026_0038_neu
+#SBATCH --partition=b200-batch
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --mem=96G
-#SBATCH --cpus-per-task=8
-#SBATCH --time=06:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
+#SBATCH --time=01:30:00
+#SBATCH --output=/scratch/%u/logs/%x-%j.out
+#SBATCH --error=/scratch/%u/logs/%x-%j.err
 
-set -e
-mkdir -p /scratch/biggs.s/llm_vae/logs
-source ~/miniconda/etc/profile.d/conda.sh
-conda activate llm_vae
-export HF_HOME=/scratch/biggs.s/hf_cache
-export HF_DATASETS_CACHE=/scratch/biggs.s/hf_cache
-export TRITON_CACHE_DIR=/scratch/biggs.s/triton_cache
+# --gres=gpu:1 is deliberate, not timid. AICR shares nodes between jobs, so a
+# 1-GPU request backfills into any partially-used node and starts immediately,
+# where an 8-GPU request waits for a whole node to drain. This stage measured
+# ~19 min / 20 GB on ONE V100; it has never needed a second GPU.
+#
+# --time=01:30 is likewise honest: backfill only slots a job into a gap it can
+# prove the job finishes inside. Asking 6h for a 20min stage forfeits every gap.
 
-ROOT=/scratch/biggs.s/llm_vae
+set -euo pipefail
+# sbatch does not set $0 to the script path, so point at the header explicitly.
+CODE_DIR="${CODE_DIR:-/work/neu/p2026_0038_neu/$USER/llm-vae}"
+source "$CODE_DIR/slurm/aicr_env.sh"
+
 RUN="${RUN:-perfam}"
 N_SAMPLES="${N_SAMPLES:-100}"
 NOISE_SCALE="${NOISE_SCALE:-3e-3}"
@@ -70,14 +73,12 @@ K_FULL=$((N_SAMPLES - 1))
 K_HALF=$((N_SAMPLES / 2))
 
 echo "=============================================="
-echo "Job      : $SLURM_JOB_ID on $SLURMD_NODENAME"
-echo "GPU      : $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "Run      : $RUN   N=$N_SAMPLES  s=$NOISE_SCALE"
 echo "Archs    : $ARCH_LIST"
 echo "Ranks    : k=$K_FULL (N-1)  and  k=$K_HALF (N/2)"
 echo "=============================================="
 
-COMMON="--mode full --run_name $RUN --artifact_dir $ROOT \
+COMMON="--mode full --run_name $RUN --artifact_dir $ARTIFACT_DIR \
         --arch_list $ARCH_LIST \
         --n_samples $N_SAMPLES --noise_scale $NOISE_SCALE \
         --exclude_1d --chunk_budget_mb 512 \
@@ -87,14 +88,14 @@ COMMON="--mode full --run_name $RUN --artifact_dir $ROOT \
         --code_noise_std 0.02 --lr 3e-4 --batch_size 64"
 
 echo; echo "######## Stage A: PCA fits + VAE at k=$K_FULL ########"
-python -u train_stack.py $COMMON --k "$K_FULL"
+python -u scripts/train_stack.py $COMMON --k "$K_FULL"
 
 echo; echo "######## Stage B: VAE at k=$K_HALF (reuses the PCA fits) ########"
-python -u train_stack.py $COMMON --k "$K_HALF"
+python -u scripts/train_stack.py $COMMON --k "$K_HALF"
 
 echo; echo "######## Stage C: evaluation, both ranks, all arms ########"
-python -u eval_stack.py --artifact_dir "$ROOT" --run_name "$RUN" --mode full \
-    --k "$K_FULL" "$K_HALF" --arms pca_only vae generate \
+python -u scripts/eval_stack.py --artifact_dir "$ARTIFACT_DIR" --run_name "$RUN" \
+    --mode full --k "$K_FULL" "$K_HALF" --arms pca_only vae generate \
     --eval_seq_len 1024 --eval_n_sequences 64
 
-echo; echo "Done — results in $ROOT/runs/$RUN/results/"
+echo; echo "Done — results in $ARTIFACT_DIR/runs/$RUN/results/"

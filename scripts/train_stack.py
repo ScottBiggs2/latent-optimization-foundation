@@ -322,7 +322,10 @@ def main() -> None:
                    default=["gpt2_medium", "smollm2_360m", "pythia_410m"])
     p.add_argument("--mode", choices=["tiny", "full"], default="full")
     p.add_argument("--run_name", default="perfam")
-    p.add_argument("--artifact_dir", default="/scratch/biggs.s/llm_vae")
+    p.add_argument("--artifact_dir",
+                   default=os.environ.get("ARTIFACT_DIR", "./artifacts"),
+                   help="Run artifacts root. slurm/aicr_env.sh exports "
+                        "ARTIFACT_DIR; this flag overrides it.")
 
     # Ensemble
     p.add_argument("--n_samples", type=int, default=100,

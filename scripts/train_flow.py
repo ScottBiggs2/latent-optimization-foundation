@@ -384,7 +384,10 @@ def train(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--artifact_dir", default="/scratch/biggs.s/llm_vae")
+    p.add_argument("--artifact_dir",
+                   default=os.environ.get("ARTIFACT_DIR", "./artifacts"),
+                   help="Run artifacts root. slurm/aicr_env.sh exports "
+                        "ARTIFACT_DIR; this flag overrides it.")
     p.add_argument("--run_name", default="perfam")
     p.add_argument("--k", type=int, default=None,
                    help="Rank. SCALAR, unlike eval_stack.py's --k: in code space a "

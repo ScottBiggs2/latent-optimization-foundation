@@ -69,8 +69,9 @@ def init_run(
     if _wandb.run is not None:
         return True
 
-    # All wandb state on scratch, never $HOME (Explorer policy — see train.py).
-    scratch = artifact_dir or os.environ.get("ARTIFACT_DIR", "/scratch/biggs.s/llm_vae")
+    # All wandb state off $HOME: the home quota is 100 GiB on AICR and a full
+    # home fails jobs in about a second, with an opaque exit code.
+    scratch = artifact_dir or os.environ.get("ARTIFACT_DIR", "./artifacts")
     os.environ.setdefault("WANDB_DIR", scratch)
 
     job_id = os.environ.get("SLURM_JOB_ID", "local")

@@ -551,7 +551,10 @@ def evaluate_arch(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--artifact_dir", default="/scratch/biggs.s/llm_vae")
+    p.add_argument("--artifact_dir",
+                   default=os.environ.get("ARTIFACT_DIR", "./artifacts"),
+                   help="Run artifacts root. slurm/aicr_env.sh exports "
+                        "ARTIFACT_DIR; this flag overrides it.")
     p.add_argument("--run_name", default="perfam")
     p.add_argument("--arch_list", nargs="+", default=None)
     p.add_argument("--k", nargs="+", type=int, default=None,

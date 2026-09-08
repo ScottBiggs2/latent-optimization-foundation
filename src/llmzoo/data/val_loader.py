@@ -3,8 +3,8 @@ Validation data loader for language-model perplexity evaluation.
 
 Default: WikiText-2 test split (~282K tokens).
 The dataset is downloaded once by HuggingFace `datasets` and cached in
-HF_HOME (defaults to ~/.cache/huggingface on a laptop; /scratch/biggs.s/hf_cache
-on HPC via the HF_HOME env var).
+HF_HOME (defaults to ~/.cache/huggingface on a laptop; slurm/aicr_env.sh points
+it at /scratch/$USER/hf_cache on the cluster, so a job never caches into $HOME).
 
 Usage
 -----
