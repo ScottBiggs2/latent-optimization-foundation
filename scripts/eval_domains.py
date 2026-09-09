@@ -183,7 +183,11 @@ def main() -> int:
     wb.init_run(job_type="zoo_gate", config={**vars(args), "beta": zmeta["beta"]},
                 tags=[args.arch, tag, "gate"], enabled=not args.no_wandb,
                 artifact_dir=zoo_dir, name_suffix=f"{tag}_gate",
-                group=f"zoo_{args.arch}_{tag}")
+                # Must match train_zoo.py's grouping exactly, including N --
+                # otherwise the gate lands in a different W&B row from the
+                # branches it scored. n_members comes from zoo_meta rather than a
+                # flag, so the two cannot drift.
+                group=f"zoo_{args.arch}_{tag}_n{int(zmeta['n_members'])}")
 
     # Cache in the ARTIFACT_DIR root, NOT under zoo_dir: the whole point is that
     # every beta of the calibration scores on the same bytes, and each beta has

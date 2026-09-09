@@ -539,7 +539,11 @@ def main() -> int:
     # Slurm job id): a beta arm spans many job ids, and the job id is what makes
     # the runs hard to relate.
     tag = f"b{round(args.beta * 100):03d}"
-    group = f"zoo_{args.arch}_{tag}"
+    # N is in the group name because a (arch, beta) pair spans MORE THAN ONE ZOO:
+    # the Phase 1 calibration was N=12 and Phase 2 is N=100 at the same beta.
+    # Without it the 100 Phase 2 branches land in the same expandable row as the
+    # 12 calibration ones and the per-domain PPL charts mix two experiments.
+    group = f"zoo_{args.arch}_{tag}_n{args.n_members}"
 
     if args.mode == "trunk":
         if os.path.exists(trunk_path):

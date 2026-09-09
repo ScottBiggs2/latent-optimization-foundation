@@ -97,6 +97,12 @@ PARTITION="${PARTITION:-b200-batch}"
 
 LAST=$((N_MEMBERS - 1))
 K=$((N_MEMBERS - 1))
+# Which array indices to submit. The default submits every member, which is the
+# documented and tested path: a member whose w_<i>.npy exists exits immediately,
+# so resubmitting verbatim after a partial array is safe and costs one no-op per
+# finished member. Override to skip a staged prefix (ARRAY=12-99) or to retry a
+# handful (ARRAY=17,43,81).
+ARRAY="${ARRAY:-0-$LAST}"
 SLUG="${ARCH#gpt2_zoo_}"
 RUN_NAME="zoo_${TAG}_${SLUG}_k$K"
 WAVES=$(( (N_MEMBERS + THROTTLE - 1) / THROTTLE ))
@@ -107,7 +113,7 @@ echo " zoo root      : $ZOO_ROOT"
 echo " spectrum run  : runs/$RUN_NAME   (k=$K)"
 echo " partition     : $PARTITION"
 echo " walltimes     : trunk=$TRUNK_TIME  branch=$BRANCH_TIME  spec=$SPEC_TIME"
-echo " concurrency   : $THROTTLE at a time  ->  $WAVES wave(s)"
+echo " array         : $ARRAY   ($THROTTLE at a time -> ~$WAVES wave(s))"
 echo " skip trunk    : $SKIP_TRUNK"
 echo "=================================================================="
 
@@ -171,9 +177,9 @@ b=$(ZOO_ROOT="$ZOO_ROOT" ARCH="$ARCH" BETA="$BETA" N_MEMBERS="$N_MEMBERS" \
     EXTRA="$EXTRA" \
     sbatch --parsable --partition="$PARTITION" --time="$BRANCH_TIME" \
            --job-name="branch_$TAG" \
-           --array="0-$LAST%$THROTTLE" "${DEP[@]}" \
+           --array="$ARRAY%$THROTTLE" "${DEP[@]}" \
            slurm/zoo_branch.sbatch)
-echo "branches   : $b  (array 0-$LAST%$THROTTLE, $WAVES wave(s))"
+echo "branches   : $b  (array $ARRAY%$THROTTLE, ~$WAVES wave(s))"
 
 # The §4.3 gate, on rtx-batch: a SEPARATE 32-GPU QOS pool, so it does not consume
 # the b200 ceiling and runs alongside the next beta's training.
