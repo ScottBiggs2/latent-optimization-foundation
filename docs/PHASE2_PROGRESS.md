@@ -288,6 +288,139 @@ Medium:
 Do not read the 3-concurrent snapshot as an argument for a fairshare conversation. Read
 it as the cost of asking for 60 minutes and 200 GB to run a 16-minute, 18 GB job.
 
+## 3.2 RESULTS — Mini N=100, both arms complete
+
+Figures: **`reports/phase2_report.html`** — open in a browser. Six panels, both themes,
+hover values, a table view per chart, self-contained. Regenerate with
+`python reports/build_phase2_figures.py && python reports/make_phase2_html.py` (both
+pure stdlib, so a figure never needs a cluster round-trip).
+
+### The §4.3 gate — PASSED on both arms, and it is a stricter test than Phase 1's
+
+| | β=0.15 | β=0.30 |
+|---|---|---|
+| separation | **5/5** | **5/5** |
+| min SNR | **18.37** | **10.86** |
+| *Phase 1, N=12* | *5.96 (3/3)* | *5.40 (3/3)* |
+
+Per-domain SNR, N=12 → N=100:
+
+| domain | β=.15 N=12 | β=.15 N=100 | β=.30 N=12 | β=.30 N=100 |
+|---|---|---|---|---|
+| web | 72.32 | 29.76 | 52.07 | 31.40 |
+| code | 34.84 | 28.22 | 54.66 | 26.49 |
+| math | 80.55 | 23.52 | 29.89 | 21.92 |
+| books | **5.96** | 21.60 | 18.66 | 23.43 |
+| multilingual | 7.02 | 18.37 | **5.40** | 10.86 |
+
+Read the direction of change. At N=12 only three domains had an anchor group, so books
+and multilingual had **no specialist model** and their between-group spread was small —
+they were the min-SNR domains that decided Phase 1. With all five anchors present every
+domain has a specialist, separation is evaluated on 5 domains rather than 3, the noise
+floor pools 15 dof instead of 9, and the *minimum* rises 5.96 → 18.37. The three
+originally-anchored domains fall because their between-group spread is now averaged over
+five groups rather than three. A harder test, passed more comfortably.
+
+Note **books passes cleanly here** (38.89 vs a best-other 68.01 at β=0.30, SNR 23.43)
+despite being the near-flat axis in the probe. Its weakness is *marginal effect inside a
+blend*, not absence of signal — given a model trained only on books, the axis is very
+visible. Both statements are true and they belong together in §6.3's scope paragraph.
+
+### §4.4 — the real test, and the prediction was mis-specified
+
+85 distinct π means the mean-centred rank is the full 99, so unlike N=12 there is **no
+design ceiling** (handoff §2). At k=99:
+
+| arm | region | ev0/median | eff_rank | eff_rank_ratio | var share |
+|---|---|---|---|---|---|
+| 0.15 | whole stack | 309.2 | 4.47 | 0.0451 | 100% |
+| 0.15 | **blocks only** | 107.3 | **7.20** | **0.0727** | 13.4% |
+| 0.15 | embeddings only | 400.9 | 4.03 | 0.0407 | 86.6% |
+| 0.30 | whole stack | 325.5 | 4.48 | 0.0452 | 100% |
+| 0.30 | **blocks only** | 118.9 | **7.31** | **0.0738** | 15.5% |
+| 0.30 | embeddings only | 421.5 | 3.98 | 0.0403 | 84.5% |
+
+§4.4 pre-registered `effective_rank_ratio ≈ 0.2–0.3`, i.e. **20–30 effective dimensions
+of 99**. Measured is **4.5** whole-stack and **7.3** block-only — 3–7× below the band.
+
+**But it misses in the opposite direction from the stated disproof condition.** §4.4's
+falsifier was a *flat* spectrum (ratio → 1.0, `ev0/median` → 1.0), which would have meant
+"branches drift into near-orthogonal directions and no generative model over these codes
+will generalize". `ev0/median` of 309–325 is the opposite finding: the structure is
+emphatically there and *more* concentrated than predicted. So the qualitative prediction
+holds and the numeric band does not.
+
+**Why the band was probably unattainable by construction.** A class here is a point on
+the 5-domain simplex, which is **Δ⁴ — four-dimensional**. However many distinct π are
+sampled, the between-mixture component of the weight distribution can span at most 4
+dimensions. Reaching `effective_rank_ratio` 0.2–0.3 would have needed 20–30, which this
+conditioning variable cannot supply. And the embeddings land at **4.03 / 3.98** — on
+dim(Δ⁴) to within 0.05.
+
+**State this carefully, because the spectrum is not literally rank-4.** Cumulative
+variance at β=0.30: embeddings reach 81.8% by component 4 and 90% only by c13; blocks
+reach 67.9% by c4 and do not reach 90% inside 24 components. So 18% of embedding variance
+and **32% of block variance** lie beyond the simplex dimension. The participation ratio
+weights by squared eigenvalue, so it reports where the mass is, not a hard cutoff. The
+honest claim:
+
+> The leading structure is ~4-dimensional and coincides with the dimension of the mixture
+> simplex; the transformer blocks carry roughly 1.8× more effective dimensions than the
+> embeddings, with a substantially heavier tail.
+
+That is a cleaner and more interpretable result than the pre-registered band, and it is
+**not** a confirmation of §4.4 as written. §6.3 and §11 both worried that "between-mixture
+structure spans ≤4 dimensions" in the five-mixture fallback; it turns out to apply with 85
+distinct mixtures too. Two consequences worth carrying into Phase 3: the flow's 99-wide
+code describes ~4.5 real dimensions, and §11's memorisation warning is therefore live
+rather than hypothetical — §6.4's retrieval baseline is the control that answers it.
+
+### Geometry — and the probe was a lower bound, as predicted
+
+| statistic | β=.15 N=12 | β=.15 probe | **β=.15 N=100** | β=.30 N=12 | β=.30 probe | **β=.30 N=100** |
+|---|---|---|---|---|---|---|
+| displacement from trunk | 16.5% | 5.0% | **7.73%** | 28.7% | 12.2% | **16.20%** |
+| spread / displacement | 0.950 | 0.748 | **1.136** | 0.878 | 0.517 | **0.930** |
+| centroid fraction | 0.741 | 0.646 | **0.682** | 0.738 | 0.646 | **0.689** |
+| between / within | 4.075 | — | **3.963** | 3.975 | — | **3.925** |
+
+`spread/displacement` at N=100 β=0.15 is **1.136**, against 0.950 for the N=12 anchors and
+0.748 for the probe — closer to the √2 = 1.414 of fully independent movement than anything
+measured so far. §3.1's prediction that the probe understates Phase 2 is confirmed.
+`between/within` is now **essentially identical across β** (3.963 vs 3.925), where at N=12
+it differed (4.075 vs 3.975) — so this statistic no longer discriminates.
+
+### β — the decision this was run to make
+
+| criterion | β=0.15 | β=0.30 | favours |
+|---|---|---|---|
+| gate separation | 5/5 | 5/5 | tie |
+| gate min SNR | **18.37** | 10.86 | 0.15 |
+| ev0/median, k=99 | 309.2 | **325.5** | 0.30 (marginal) |
+| eff_rank_ratio, whole | 0.0451 | 0.0452 | **tie** |
+| eff_rank_ratio, blocks | 0.0727 | **0.0738** | 0.30 (marginal) |
+| between/within | **3.963** | 3.925 | tie |
+| spread/displacement | **1.136** | 0.930 | 0.15 |
+| probe pooled slope | +0.328 | **+0.693** | 0.30 |
+| probe domains positive | **5/5** | 4/5 | 0.15 |
+| Small + Medium cost | **~446 GPU-hr** | ~863 | 0.15 |
+
+**The spectrum does not discriminate** — 0.0451 vs 0.0452 whole-stack, 0.0727 vs 0.0738
+block-only. That is itself the answer to the question this run was posed: the k=99 spectrum
+gives no reason to prefer 0.30.
+
+**Recommendation: β = 0.15**, which is what §4.3's "smallest β at which mixture identity is
+measurable" rule selects, and it saves **~417 GPU-hr** across Small and Medium (Small
+137 → 71, Medium 726 → 375, using the measured `F` implied by each). The sole reason the
+handoff overrode that rule was "headroom for the singleton regime N=12 could not test" —
+and that regime has now been tested, with β=0.15 passing it 5/5.
+
+**The one argument for 0.30** is the probe's pooled slope, 2.1× stronger (+0.693 vs
++0.328). That is conditioning signal for Phase 3's flow to learn, and it is a real
+consideration rather than a rounding difference. It trades ~417 GPU-hr for a stronger
+control signal. **This is a judgment call for Scott, not something the measurements
+settle.**
+
 ## 4. Traps found this session, all now in CLAUDE.md
 
 1. **A singleton mixture opens FIVE HF streams; an anchor opens one.** The very first

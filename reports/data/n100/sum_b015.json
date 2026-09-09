@@ -1,0 +1,30 @@
+{
+  "run_name": "zoo_b015_mini_k99",
+  "k": 99,
+  "n_samples": 100,
+  "noise_scale": 0.0,
+  "arch_list": [
+    "gpt2_zoo_mini"
+  ],
+  "exclude_1d": false,
+  "include_extra": true,
+  "per_arch": {
+    "gpt2_zoo_mini": {
+      "n_params": 51475968,
+      "n_layers": 8,
+      "block_size": 3152384,
+      "extra_size": 26256896,
+      "fitted_k": 99,
+      "variance_captured_at_k": 0.9999999999985302,
+      "spectrum_ev0_over_evlast": 399.36679635947957,
+      "spectrum_ev0_over_median": 309.15349244819095,
+      "spectrum_effective_rank_ratio": 0.045107531983747964,
+      "spectrum_effective_rank": 4.465645666391048
+    }
+  },
+  "ensemble_fingerprint": "0d35b58cad8d6039",
+  "pca_fingerprints": {
+    "gpt2_zoo_mini": "3885dbbf364733a7"
+  },
+  "code_stats_fingerprint": "45121502c46f52db"
+}
