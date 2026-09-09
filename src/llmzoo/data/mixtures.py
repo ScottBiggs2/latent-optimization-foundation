@@ -140,6 +140,19 @@ def is_holdout(text: str) -> bool:
 #   2. This retry. Exponential backoff with FULL JITTER, which also
 #      de-synchronises an array whose tasks all started at once -- so the retry
 #      *is* the stagger, and no job that would have succeeded pays a sleep.
+# base_delay=12 with retries=6 gives a full-jitter budget of
+# 12*(2^6-1) = 756 s worst case, ~6 min expected. That is sized to CROSS the
+# quota window, and the window is the whole point:
+#
+#   authenticated 2026-09-08: "you hit the quota of 1000 api requests per
+#   5 minutes period"
+#
+# The first version used base_delay=3.0, i.e. a 93 s worst-case budget -- all six
+# attempts could land inside ONE exhausted 5-minute window and the job died
+# anyway. That is exactly what happened to 8 of 153 Phase 2 branches. Anonymous
+# rate limiting is per-IP and was survivable in seconds; authenticated limiting
+# is per-USER with a fixed window, so the backoff has to outlast the window
+# rather than merely spread the burst.
 RETRYABLE_MARKERS = (
     "429", "too many requests", "rate limit", "ratelimit",
     "502", "503", "504", "timed out", "timeout",
@@ -156,7 +169,7 @@ def open_domain_stream(
     domain: str,
     *,
     retries: int = 6,
-    base_delay: float = 3.0,
+    base_delay: float = 12.0,
     log=print,
 ) -> Tuple[object, str]:
     """

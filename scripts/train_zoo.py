@@ -48,7 +48,7 @@ import torch
 from llmzoo.artifacts.io import atomic_write_json
 from llmzoo.data.mixtures import (
     DOMAIN_SOURCES, DOMAINS, build_zoo_plan, holdout_split, is_holdout,
-    n_domains, open_domain_stream,
+    n_domains, open_domain_stream, _is_retryable,
 )
 from llmzoo.data.ensemble import ENSEMBLE_LAYOUT_VERSION
 from llmzoo.models.registry import (
@@ -278,7 +278,7 @@ def _steady(windows: List[float], seen: float, elapsed: float,
 def train_span(model, opt, pi, *, tokenizer, device, n_ctx, batch_size,
                grad_accum, start_step, n_steps, total_steps, peak_lr, warmup,
                seed, log_every=50, amp_dtype=torch.bfloat16,
-               n_params=None, peak_tflops=None):
+               n_params=None, peak_tflops=None, max_restarts=8):
     """
     Train `n_steps` optimizer steps on mixture `pi`, resuming the global LR
     schedule at `start_step`.
@@ -313,6 +313,9 @@ def train_span(model, opt, pi, *, tokenizer, device, n_ctx, batch_size,
     # knowing (it is paid 39 times across a 3-beta calibration), it is just not
     # a throughput.
     t_ready, seen_at_ready = None, 0
+    # Stream rebuilds, whether from exhaustion or from a mid-stream shard error.
+    # Also the data seed offset, so a rebuild does not re-read the same prefix.
+    restarts = 0
     # Even after t_ready the run-to-date average keeps climbing for a while
     # (CUDA/cuBLAS warmup, and the shuffle buffers are still topping up over the
     # network while the first steps run). Measured on an RTX trunk: the average
@@ -331,8 +334,37 @@ def train_span(model, opt, pi, *, tokenizer, device, n_ctx, batch_size,
             try:
                 x, y = next(bit)
             except StopIteration:                     # corpus exhausted: restart
+                restarts += 1
                 gen = mixture_stream(np.asarray(pi, dtype=np.float64), tokenizer,
-                                     n_ctx, seed + 1)
+                                     n_ctx, seed + restarts)
+                bit = batches(gen, batch_size, device)
+                x, y = next(bit)
+            except Exception as e:                    # noqa: BLE001
+                # A SHARD FETCH CAN FAIL MID-STREAM, long after
+                # open_domain_stream returned successfully. Seen in Phase 2:
+                #
+                #   FileNotFoundError: gzip://file-000000000010.json::hf://
+                #   datasets/codeparrot/codeparrot-clean@35a59fb/...json.gz
+                #
+                # open_domain_stream's retry cannot help -- it wraps the OPEN,
+                # and this is raised from inside the datasets iterator hundreds
+                # of steps in. Note also that a bare FileNotFoundError is
+                # deliberately NOT retryable at open time (it means a dead
+                # dataset id), so it is classified here by the same predicate
+                # but acted on differently: rebuild the stream and carry on,
+                # because the alternative is losing a member 20 minutes in.
+                if not _is_retryable(e) and not isinstance(e, OSError):
+                    raise
+                restarts += 1
+                if restarts > max_restarts:
+                    log(f"  stream failed {restarts} times, giving up: "
+                        f"{type(e).__name__}: {e}")
+                    raise
+                log(f"  stream died at step {step} "
+                    f"({type(e).__name__}: {str(e)[:120]}); rebuilding, "
+                    f"restart {restarts}/{max_restarts}")
+                gen = mixture_stream(np.asarray(pi, dtype=np.float64), tokenizer,
+                                     n_ctx, seed + restarts)
                 bit = batches(gen, batch_size, device)
                 x, y = next(bit)
             if t_ready is None:
@@ -385,6 +417,7 @@ def train_span(model, opt, pi, *, tokenizer, device, n_ctx, batch_size,
             "tokens_per_sec": round(tps, 1),            # median recent interval
             "tokens_per_sec_avg": round(avg, 1),        # post-startup average
             "n_windows": len(windows),
+            "stream_restarts": restarts,
             "mfu": _mfu(tps, n_params, peak_tflops),
             "peak_tflops": peak_tflops,
             "final_loss": float(tot)}
