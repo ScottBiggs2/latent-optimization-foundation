@@ -113,6 +113,89 @@ def is_holdout(text: str) -> bool:
     return int.from_bytes(digest[:8], "big") % HOLDOUT_EVERY == 0
 
 
+# ---------------------------------------------------------------------------
+# Opening a domain stream, with the retry the beta calibration never needed
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS, AND WHY PHASE 1 COULD NOT HAVE FOUND IT.
+#
+# A ONE-HOT anchor mixture takes `mixture_stream`'s `len(streams) == 1` fast
+# path, so each of the beta calibration's 39 jobs resolved exactly ONE dataset.
+# Every SINGLETON resolves FIVE, and a 32-wide branch array therefore issues
+# ~160 near-simultaneous dataset-resolution calls from one cluster IP.
+#
+# Measured 2026-09-08: five sequential anonymous calls from a single `cpu` node
+# were already enough to draw
+#
+#     429 Client Error: Too Many Requests ... We had to rate limit your IP
+#     (192.69.103.196). To continue using our service, create a HF account or
+#     login to your existing account
+#
+# Two independent mitigations, both wanted:
+#   1. HF_TOKEN now reaches jobs via ~/.config/llmzoo/env (mode 600). An
+#      authenticated request gets a far higher limit. Note this changes only the
+#      auth header -- the corpora are the same UNGATED ids, so the beta
+#      calibration stays valid. It is NOT licence to switch to a gated corpus
+#      (RESEARCH_PLAN §6.3).
+#   2. This retry. Exponential backoff with FULL JITTER, which also
+#      de-synchronises an array whose tasks all started at once -- so the retry
+#      *is* the stagger, and no job that would have succeeded pays a sleep.
+RETRYABLE_MARKERS = (
+    "429", "too many requests", "rate limit", "ratelimit",
+    "502", "503", "504", "timed out", "timeout",
+    "connectionerror", "connectionreset", "incompleteread",
+)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return any(m in blob for m in RETRYABLE_MARKERS)
+
+
+def open_domain_stream(
+    domain: str,
+    *,
+    retries: int = 6,
+    base_delay: float = 3.0,
+    log=print,
+) -> Tuple[object, str]:
+    """
+    `load_dataset(..., streaming=True)` for one domain, retrying HF rate limits.
+
+    Returns `(dataset, text_column)`. Raises the last exception if every attempt
+    fails, because a persistent 429 is a real problem to surface rather than
+    something to loop on forever.
+
+    `datasets` is imported inside the call on purpose: `import
+    llmzoo.data.mixtures` must stay cheap enough for the plan path and the tests,
+    which never open a stream.
+    """
+    import random
+    import time
+
+    from datasets import load_dataset
+
+    src = DOMAIN_SOURCES[domain]
+    last: Optional[BaseException] = None
+    for attempt in range(retries):
+        try:
+            return (load_dataset(src["path"], src["name"], split=src["split"],
+                                 streaming=True),
+                    src["text_column"])
+        except Exception as e:                                # noqa: BLE001
+            last = e
+            if attempt == retries - 1 or not _is_retryable(e):
+                raise
+            # Full jitter: sleep ~U(0, base*2^attempt). Uniform-from-zero rather
+            # than a fixed backoff is what actually spreads a synchronised array
+            # instead of moving the whole thundering herd to a later instant.
+            delay = random.uniform(0.0, base_delay * (2 ** attempt))
+            log(f"  {domain}: {type(e).__name__} on attempt "
+                f"{attempt + 1}/{retries}, retrying in {delay:.1f}s")
+            time.sleep(delay)
+    raise last                                                # unreachable
+
+
 def n_domains() -> int:
     return len(DOMAINS)
 

@@ -39,7 +39,7 @@ import numpy as np
 import torch
 
 from llmzoo.artifacts.io import atomic_write_json
-from llmzoo.data.mixtures import DOMAINS, DOMAIN_SOURCES, is_holdout
+from llmzoo.data.mixtures import DOMAINS, is_holdout, open_domain_stream
 from llmzoo.models.registry import build_zoo_model
 from llmzoo.models.weight_extractor import build_stack_spec, write_stack_to_model
 import llmzoo.wandb_utils as wb
@@ -66,16 +66,16 @@ def held_out_text(domain: str, tokenizer, n_docs: int, n_ctx: int, seed: int):
     many raw ones -- on the books domain (195 KB/doc) a 2,000-doc buffer means
     streaming the whole corpus to pick 2 documents.
     """
-    from datasets import load_dataset
-
-    src = DOMAIN_SOURCES[domain]
-    ds = load_dataset(src["path"], src["name"], split=src["split"], streaming=True)
-    ds = ds.filter(lambda r, _c=src["text_column"]: is_holdout(r[_c]))
+    # Retrying opener (mixtures.open_domain_stream): the gate resolves all five
+    # domains back to back, which is exactly the burst that drew a 429 on
+    # 2026-09-08.
+    ds, col = open_domain_stream(domain)
+    ds = ds.filter(lambda r, _c=col: is_holdout(r[_c]))
     buf: List[int] = []
     blocks = []
     need = n_ctx + 1
     for row in ds:
-        t = row.get(src["text_column"])
+        t = row.get(col)
         if not t:
             continue
         buf.extend(tokenizer(t, add_special_tokens=False)["input_ids"])

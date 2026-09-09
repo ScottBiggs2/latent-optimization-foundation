@@ -48,7 +48,7 @@ import torch
 from llmzoo.artifacts.io import atomic_write_json
 from llmzoo.data.mixtures import (
     DOMAIN_SOURCES, DOMAINS, build_zoo_plan, holdout_split, is_holdout,
-    n_domains,
+    n_domains, open_domain_stream,
 )
 from llmzoo.data.ensemble import ENSEMBLE_LAYOUT_VERSION
 from llmzoo.models.registry import (
@@ -78,20 +78,20 @@ def verify_domains(n_docs: int = 1) -> int:
     single cheapest way to find out that a dataset id moved or went gated before a
     zoo job discovers it 40 minutes in.
     """
-    from datasets import load_dataset
-
     bad = []
     for dom in DOMAINS:
         src = DOMAIN_SOURCES[dom]
         try:
-            ds = load_dataset(src["path"], src["name"], split=src["split"],
-                              streaming=True)
+            # open_domain_stream, not a bare load_dataset: an HF 429 would
+            # otherwise be reported as a dead dataset id, which is the wrong
+            # diagnosis and invites the one edit RESEARCH_PLAN §6.3 forbids.
+            ds, col = open_domain_stream(dom, log=log)
             it = iter(ds)
             for _ in range(n_docs):
                 row = next(it)
-            if src["text_column"] not in row:
+            if col not in row:
                 raise KeyError(
-                    f"text_column={src['text_column']!r} not in {sorted(row)[:8]}")
+                    f"text_column={col!r} not in {sorted(row)[:8]}")
             log(f"  OK       {dom:<14} {src['path']}"
                 f"{'/' + src['name'] if src['name'] else ''}")
         except Exception as e:                                # noqa: BLE001
@@ -154,7 +154,7 @@ def mixture_stream(pi: np.ndarray, tokenizer, n_ctx: int, seed: int):
     with p=0 -- some versions still open the stream, which for a gated corpus means
     an auth error on a mixture that does not use it.
     """
-    from datasets import interleave_datasets, load_dataset
+    from datasets import interleave_datasets
 
     keep = [i for i, w in enumerate(pi) if w > 1e-6]
     if not keep:
@@ -164,16 +164,16 @@ def mixture_stream(pi: np.ndarray, tokenizer, n_ctx: int, seed: int):
 
     streams, cols = [], []
     for i in keep:
-        src = DOMAIN_SOURCES[DOMAINS[i]]
-        d = load_dataset(src["path"], src["name"], split=src["split"],
-                         streaming=True)
+        # Retrying opener: a singleton mixture resolves FIVE datasets where an
+        # anchor resolves one, and a 32-wide array makes ~160 calls at once.
+        d, col = open_domain_stream(DOMAINS[i])
         # Drop the evaluation split. eval_domains.py keeps exactly the
         # complement, so the §4.3 gate never scores a model on text it trained
         # on. The predicate is a content hash, so duplicate documents -- which
         # these corpora do contain -- cannot land on both sides.
-        d = d.filter(lambda r, _c=src["text_column"]: not is_holdout(r[_c]))
+        d = d.filter(lambda r, _c=col: not is_holdout(r[_c]))
         streams.append(d.shuffle(seed=seed, buffer_size=10_000))
-        cols.append(src["text_column"])
+        cols.append(col)
 
     if len(streams) == 1:
         merged, col_of = streams[0], (lambda _row: cols[0])
