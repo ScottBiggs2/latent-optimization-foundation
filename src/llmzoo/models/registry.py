@@ -220,9 +220,81 @@ ARCH_CONFIGS: dict[str, dict] = {
             use_parallel_residual=True,
         ),
     },
+    # ── The zoo architectures (RESEARCH_PLAN §4.5) ─────────────────────────
+    # GPT-2, held as close to the published configuration as HF allows:
+    # Radford, Wu, Child, Luan, Amodei & Sutskever (2019), "Language Models are
+    # Unsupervised Multitask Learners", OpenAI. https://github.com/openai/gpt-2
+    #
+    # These are trained FROM SCRATCH by scripts/train_zoo.py, so they have no
+    # default_model_id. `from_scratch: True` is what stops load_model() trying to
+    # download them.
+    #
+    # Small and Medium are exactly the published 124M and 355M configurations.
+    # Mini has no published equivalent and is ours; it is labelled as such in the
+    # paper. Vocab stays 50257 at every scale — shrinking it for Mini would change
+    # the tokenizer, and a scaling comparison across tokenizers is not one.
+    #
+    # HF's GPT2LMHeadModel gives us the published initialization for free: its
+    # _init_weights scales every `c_proj.weight` by 1/sqrt(2 * n_layer), which is
+    # the paper's "scale residual weights by 1/sqrt(N)".
+    "gpt2_zoo_mini": {
+        "hf_model_type": "gpt2",
+        "layers_attr":   "transformer.h",
+        "family_idx":    6,
+        "from_scratch":  True,
+        "zoo_config": dict(n_embd=512, n_layer=8, n_head=8),
+        "tiny_config": dict(n_embd=128, n_layer=2, n_head=4, n_inner=512,
+                            vocab_size=1000, n_positions=512, n_ctx=512),
+    },
+    "gpt2_zoo_small": {
+        "hf_model_type": "gpt2",
+        "layers_attr":   "transformer.h",
+        "family_idx":    7,
+        "from_scratch":  True,
+        # == published GPT-2 124M
+        "zoo_config": dict(n_embd=768, n_layer=12, n_head=12),
+        "tiny_config": dict(n_embd=128, n_layer=2, n_head=4, n_inner=512,
+                            vocab_size=1000, n_positions=512, n_ctx=512),
+    },
+    "gpt2_zoo_medium": {
+        "hf_model_type": "gpt2",
+        "layers_attr":   "transformer.h",
+        "family_idx":    8,
+        "from_scratch":  True,
+        # == published GPT-2 355M
+        "zoo_config": dict(n_embd=1024, n_layer=24, n_head=16),
+        "tiny_config": dict(n_embd=128, n_layer=2, n_head=4, n_inner=512,
+                            vocab_size=1000, n_positions=512, n_ctx=512),
+    },
 }
 
-N_FAMILIES = len(ARCH_CONFIGS)
+# How many architectures are registered. Informational only -- do NOT use this to
+# size a conditioning table (see N_COND_SLOTS).
+N_ARCHS = len(ARCH_CONFIGS)
+
+# Conditioning-table size for StackVAE and FlowVelocityNet.
+#
+# This was `len(ARCH_CONFIGS)` until 2026-09-08, which meant **registering a new
+# architecture silently changed every embedding table's shape** and invalidated
+# every saved checkpoint. Adding the three zoo entries above would have moved it
+# 6 -> 9 on its own. It is now a fixed, generous constant that no registry edit can
+# move: 32 slots x cond_dim 64 is 2048 parameters, which is free.
+#
+# RESEARCH_PLAN Phase 0.2. The conditioning axis is on its way to becoming a
+# continuous mixture vector (§6.2) at which point this stops mattering entirely,
+# but until then it must not be coupled to the registry.
+N_COND_SLOTS = 32
+
+# Back-compat alias. Existing call sites pass this as `n_families`; it now resolves
+# to the fixed slot count rather than the registry size, which is the fix.
+N_FAMILIES = N_COND_SLOTS
+
+if N_ARCHS > N_COND_SLOTS:
+    raise RuntimeError(
+        f"{N_ARCHS} architectures registered but only {N_COND_SLOTS} conditioning "
+        f"slots. Raise N_COND_SLOTS -- but note that doing so changes every "
+        f"conditioning-table shape and therefore invalidates saved checkpoints."
+    )
 
 # Maximum block index across all architectures (for embedding table sizing)
 MAX_BLOCKS = max(
@@ -265,6 +337,13 @@ def load_model(
     from transformers import AutoModelForCausalLM
 
     cfg = get_arch_config(arch)
+    if cfg.get("from_scratch") and model_id is None:
+        raise ValueError(
+            f"'{arch}' is a zoo architecture trained from scratch -- it has no "
+            f"default_model_id and nothing to download. Use build_zoo_model('{arch}') "
+            f"to construct it, or pass model_id= explicitly to load a local "
+            f"checkpoint directory."
+        )
     mid = model_id or cfg["default_model_id"]
     hf_token = token or os.environ.get("HF_TOKEN")
     # None lets huggingface_hub fall back to its own default; the sbatch scripts
@@ -303,6 +382,82 @@ def build_tiny_model(arch: str) -> nn.Module:
     model = AutoModelForCausalLM.from_config(hf_cfg)
     model.eval()
     return model
+
+
+# GPT-2's published hyperparameters, held fixed across the whole zoo ladder so the
+# only thing that varies with scale is (n_layer, n_embd, n_head).
+#
+#   pre-LayerNorm with an extra LN after the final block ...... GPT2Model, built in
+#   learned absolute positions, n_positions = 1024 ............ n_positions
+#   GELU, n_inner = 4 * n_embd ............................... activation_function
+#   biases on every Conv1D projection ........................ built in
+#   tied wte / lm_head ....................................... tie_word_embeddings
+#   BPE vocab 50257 .......................................... vocab_size
+#   residual weights scaled 1/sqrt(2 * n_layer) at init ...... GPT2PreTrainedModel
+#
+# The one deliberate deviation is dropout. GPT-2 published 0.1, but the zoo is
+# trained for a single Chinchilla-optimal pass over a corpus far larger than the
+# model, where there is nothing to overfit and dropout only costs signal. Standard
+# practice for from-scratch pretraining (nanoGPT and successors use 0.0). Set
+# GPT2_ZOO_DROPOUT to 0.1 to reproduce the published value exactly.
+GPT2_ZOO_VOCAB_SIZE = 50257
+GPT2_ZOO_N_POSITIONS = 1024
+GPT2_ZOO_DROPOUT = 0.0
+
+
+def zoo_config(arch: str, *, dropout: Optional[float] = None) -> "object":
+    """Return the HF GPT2Config for a zoo architecture. No weights, no download."""
+    from transformers import GPT2Config
+
+    cfg = get_arch_config(arch)
+    if "zoo_config" not in cfg:
+        raise ValueError(f"'{arch}' has no zoo_config; it is not a zoo architecture.")
+    if cfg["hf_model_type"] != "gpt2":
+        raise ValueError(f"zoo_config() is GPT-2 only; '{arch}' is "
+                         f"{cfg['hf_model_type']}.")
+    z = cfg["zoo_config"]
+    p = GPT2_ZOO_DROPOUT if dropout is None else float(dropout)
+    return GPT2Config(
+        vocab_size=GPT2_ZOO_VOCAB_SIZE,
+        n_positions=GPT2_ZOO_N_POSITIONS,
+        n_embd=z["n_embd"],
+        n_layer=z["n_layer"],
+        n_head=z["n_head"],
+        n_inner=4 * z["n_embd"],
+        activation_function="gelu_new",
+        resid_pdrop=p, embd_pdrop=p, attn_pdrop=p,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        tie_word_embeddings=True,
+    )
+
+
+def build_zoo_model(arch: str, *, seed: Optional[int] = None,
+                    dropout: Optional[float] = None) -> nn.Module:
+    """
+    Construct a randomly-initialised GPT-2 at one of the zoo scales.
+
+    `seed` sets the initialization. The trunk is built once with a fixed seed and
+    every branch descends from it (RESEARCH_PLAN §4.1), so branches must NOT call
+    this with different seeds -- they load the trunk checkpoint. This argument
+    exists for the trunk itself and for the independent-init control arm.
+    """
+    from transformers import GPT2LMHeadModel
+
+    if seed is not None:
+        torch.manual_seed(int(seed))
+    model = GPT2LMHeadModel(zoo_config(arch, dropout=dropout))
+    return model
+
+
+def zoo_param_count(arch: str) -> dict:
+    """Analytic parameter counts. Cheap enough to assert against in a smoke test."""
+    z = get_arch_config(arch)["zoo_config"]
+    d, L = z["n_embd"], z["n_layer"]
+    blocks = L * (12 * d * d + 13 * d)
+    emb = GPT2_ZOO_VOCAB_SIZE * d + GPT2_ZOO_N_POSITIONS * d
+    return {"blocks": blocks, "embeddings": emb, "total": blocks + emb + 2 * d,
+            "embedding_fraction": emb / (blocks + emb + 2 * d)}
 
 
 def get_layers(model: nn.Module, arch: str):

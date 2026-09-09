@@ -87,6 +87,115 @@ MIN_CHUNK_ELEMS = 262_144
 MAX_CHUNK_ELEMS = 8_388_608
 
 
+# Where an ensemble's members come from. RESEARCH_PLAN Phase 0.3.
+#
+#   "noise" : members 1..N-1 are w_0 + s*sigma*eps_i, regenerated from a seed on
+#             every pass and never written to disk. The machinery test, and the
+#             beta -> 0 reference point of RESEARCH_PLAN §4.2.
+#   "zoo"   : members are genuinely different trained models, one .npy each,
+#             produced by scripts/train_zoo.py. No noise, no seed, no w_0 anywhere
+#             -- member 0 is not privileged and must not be treated as such.
+#
+# `source` is already inside ensemble_fingerprint() (defaulting to "noise"), so
+# switching it invalidates every downstream artifact automatically and a zoo PCA
+# can never be paired with a noise-ensemble VAE.
+ENSEMBLE_SOURCES = ("noise", "zoo")
+
+
+class MemberSource:
+    """
+    Where the rows of one chunk come from.
+
+    One method, deliberately: given a stack and a half-open element range, return
+    (n_samples, r1-r0) float32. Everything above this -- the chunk grid, the Gram
+    accumulation, PCA, the flow -- is indifferent to which subclass it got.
+    """
+
+    def load_rows(self, ds: "EnsembleDataset", arch: str, chunk_idx: int,
+                  r0: int, r1: int, device, w0_mm) -> torch.Tensor:
+        raise NotImplementedError
+
+    def state(self) -> dict:
+        raise NotImplementedError
+
+
+class NoiseSource(MemberSource):
+    """w_0 + s*sigma*eps_i, regenerated from (seed, chunk_idx) on every pass."""
+
+    def load_rows(self, ds, arch, chunk_idx, r0, r1, device, w0_mm):
+        st = ds.stacks[arch]
+        L = r1 - r0
+        # np.array (not ascontiguousarray) to force a writable copy: w0 is opened
+        # read-only via mmap and torch.from_numpy warns on non-writable buffers.
+        base = torch.from_numpy(np.array(w0_mm[r0:r1])).to(device)
+
+        # Written in place so peak memory is one (N, L) block rather than two --
+        # a repeat() plus a separate randn() would double the chunk budget.
+        out = torch.empty((ds.n_samples, L), device=base.device, dtype=base.dtype)
+        out[0] = base                                  # sample 0 is the real model
+        if ds.n_samples > 1:
+            if ds.noise_scale > 0.0:
+                g = torch.Generator(device=out.device)
+                # Same grid + same seed => same ensemble on every pass.
+                g.manual_seed((ds.seed * 1_000_003 + chunk_idx) % (2**63 - 1))
+                torch.randn((ds.n_samples - 1, L), generator=g,
+                            device=out.device, dtype=out.dtype, out=out[1:])
+                out[1:].mul_(ds.noise_scale * st.weight_std).add_(base)
+            else:
+                out[1:] = base
+        return out
+
+    def state(self) -> dict:
+        return {"source": "noise"}
+
+
+class ZooSource(MemberSource):
+    """
+    N genuinely different trained models, one `w_<i>.npy` per member.
+
+    Memmaps are opened once per (arch, member) and cached, because a Gram fit walks
+    every chunk of every member and reopening N files per chunk is the difference
+    between minutes and hours on a shared filesystem.
+
+    No member is privileged here. `w0(arch)` still returns member 0 because the rest
+    of the pipeline needs *a* reference stack to write back into, but for a zoo it is
+    an arbitrary member, not a centre -- so `--sample_idx 0` loses the special
+    meaning it has for a noise ensemble (RESEARCH_NOTES misstep 9).
+    """
+
+    def __init__(self, zoo_dir: str):
+        self.zoo_dir = zoo_dir
+        self._mm: Dict[Tuple[str, int], np.ndarray] = {}
+
+    def member_path(self, arch: str, i: int) -> str:
+        return os.path.join(self.zoo_dir, arch, f"w_{i}.npy")
+
+    def _member(self, arch: str, i: int) -> np.ndarray:
+        key = (arch, i)
+        if key not in self._mm:
+            self._mm[key] = np.load(self.member_path(arch, i), mmap_mode="r")
+        return self._mm[key]
+
+    def load_rows(self, ds, arch, chunk_idx, r0, r1, device, w0_mm):
+        out = torch.empty((ds.n_samples, r1 - r0), device=device, dtype=torch.float32)
+        for i in range(ds.n_samples):
+            out[i] = torch.from_numpy(np.array(self._member(arch, i)[r0:r1])).to(device)
+        return out
+
+    def state(self) -> dict:
+        return {"source": "zoo", "zoo_dir": self.zoo_dir}
+
+
+def build_source(source: str, *, zoo_dir: Optional[str] = None) -> MemberSource:
+    if source not in ENSEMBLE_SOURCES:
+        raise ValueError(f"source must be one of {ENSEMBLE_SOURCES}; got {source!r}")
+    if source == "noise":
+        return NoiseSource()
+    if zoo_dir is None:
+        raise ValueError("source='zoo' requires zoo_dir=")
+    return ZooSource(zoo_dir)
+
+
 @dataclass
 class ArchStack:
     """
@@ -138,6 +247,11 @@ class EnsembleDataset:
     artifact_dir  : root for the ensemble/ subdirectory
     seed          : base seed for noise generation
     chunk_budget_bytes : target size of one in-flight (N, chunk) block
+    source        : 'noise' (default, members regenerated from a seed) or 'zoo'
+                    (members read from disk, one w_<i>.npy each). See
+                    ENSEMBLE_SOURCES.
+    zoo_dir       : required when source='zoo'. Expects <zoo_dir>/<arch>/w_<i>.npy
+                    for i in 0..n_samples-1, all the same length.
     """
 
     def __init__(
@@ -152,6 +266,8 @@ class EnsembleDataset:
         seed: int = 42,
         chunk_budget_bytes: int = DEFAULT_CHUNK_BUDGET_BYTES,
         force_extract: bool = False,
+        source: str = "noise",
+        zoo_dir: Optional[str] = None,
     ):
         if arch_list is None:
             arch_list = list_archs()
@@ -168,6 +284,17 @@ class EnsembleDataset:
         self.artifact_dir = artifact_dir
         self.seed = int(seed)
         self.chunk_budget_bytes = int(chunk_budget_bytes)
+        self.source = str(source)
+        self.zoo_dir = zoo_dir
+        self._src = build_source(self.source, zoo_dir=zoo_dir)
+
+        if self.source == "zoo" and self.noise_scale != 0.0:
+            raise ValueError(
+                f"source='zoo' with noise_scale={self.noise_scale} would add "
+                f"augmentation noise on top of genuinely different models, which is "
+                f"not what any part of RESEARCH_PLAN §4 describes. Pass "
+                f"noise_scale=0.0."
+            )
 
         self.ens_dir = os.path.join(artifact_dir, "ensemble")
         os.makedirs(self.ens_dir, exist_ok=True)
@@ -186,7 +313,11 @@ class EnsembleDataset:
 
     def _extract(self, meta_path: str) -> None:
         for arch in self.arch_list:
-            print(f"\n[EnsembleDataset] Extracting {arch} ({self.mode}) …")
+            print(f"\n[EnsembleDataset] Extracting {arch} ({self.mode}, "
+                  f"source={self.source}) …")
+            if self.source == "zoo":
+                self._extract_zoo(arch)
+                continue
             model = build_tiny_model(arch) if self.mode == "tiny" else load_model(arch)
             model.eval()
             cfg = get_arch_config(arch)
@@ -256,6 +387,75 @@ class EnsembleDataset:
 
         self._save_meta(meta_path)
 
+    def _extract_zoo(self, arch: str) -> None:
+        """
+        Adopt a pre-flattened zoo. No model is loaded and nothing is re-flattened:
+        scripts/train_zoo.py already wrote one (D,) float32 per member plus the
+        schema, and re-deriving it here would be a second implementation of the
+        layout that could drift from the first.
+        """
+        adir = os.path.join(self.zoo_dir, arch)
+        zmeta_path = os.path.join(adir, "zoo_meta.json")
+        if not os.path.exists(zmeta_path):
+            raise FileNotFoundError(
+                f"source='zoo' but {zmeta_path} is missing. Run scripts/train_zoo.py "
+                f"for {arch} first.")
+        with open(zmeta_path) as f:
+            z = json.load(f)
+
+        if z.get("layout_version") != ENSEMBLE_LAYOUT_VERSION:
+            raise RuntimeError(
+                f"{zmeta_path}: layout_version={z.get('layout_version')!r} but this "
+                f"code expects {ENSEMBLE_LAYOUT_VERSION}.")
+        # The flattening flags are baked into the .npy files, so a mismatch here
+        # means D means something different than this run thinks it does.
+        for key, mine in (("exclude_1d", self.exclude_1d),
+                          ("include_extra", self.include_extra)):
+            if z.get(key) != mine:
+                raise RuntimeError(
+                    f"{zmeta_path}: zoo was flattened with {key}={z.get(key)!r} but "
+                    f"this run asks for {mine!r}. Re-flatten or change the flag.")
+        if int(z["n_members"]) < self.n_samples:
+            raise RuntimeError(
+                f"{arch}: zoo has {z['n_members']} members, run asks for "
+                f"n_samples={self.n_samples}.")
+
+        D = int(z["n_params"])
+        for i in range(self.n_samples):
+            p = self._src.member_path(arch, i)
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"{arch}: member {i} missing at {p}")
+            # Read the header only -- np.load(mmap_mode='r') does not read the body,
+            # so this validates N files in milliseconds rather than reading ~D*N bytes.
+            n = int(np.load(p, mmap_mode="r").shape[0])
+            if n != D:
+                raise ValueError(
+                    f"{arch}: member {i} has D={n:,} but zoo_meta says {D:,}. A zoo "
+                    f"with ragged members cannot be a fixed-length PCA sample.")
+
+        cfg = get_arch_config(arch)
+        self.stacks[arch] = ArchStack(
+            arch=arch,
+            family_idx=int(cfg["family_idx"]),
+            n_layers=int(z["n_layers"]),
+            block_size=int(z["block_size"]),
+            n_params=D,
+            # Informational only for a zoo: nothing scales noise by it, because
+            # there is no noise. Kept so the metadata schema is uniform.
+            weight_std=float(z.get("weight_std", 0.0)),
+            schema=[ParamEntry(n, tuple(s)) for n, s in z["schema"]],
+            # Member 0 is an ARBITRARY member, not a centre. It is the write-back
+            # reference only. misstep 9's sample_idx warning does not apply here.
+            w0_path=self._src.member_path(arch, 0),
+            extra_size=int(z.get("extra_size", 0)),
+            extra_schema=[ParamEntry(n, tuple(s))
+                          for n, s in z.get("extra_schema", [])],
+        )
+        pct = 100.0 * int(z.get("extra_size", 0)) / max(D, 1)
+        print(f"  {arch}: N={self.n_samples}  L={z['n_layers']}  "
+              f"block={int(z['block_size']):,}  extra={int(z.get('extra_size', 0)):,} "
+              f"({pct:.1f}%)  D={D:,}  [zoo]")
+
     def _save_meta(self, meta_path: str) -> None:
         meta = {
             "layout_version": ENSEMBLE_LAYOUT_VERSION,
@@ -267,6 +467,10 @@ class EnsembleDataset:
             "mode": self.mode,
             "seed": self.seed,
             "chunk_budget_bytes": self.chunk_budget_bytes,
+            # Only written when non-default, so a source="noise" ensemble
+            # fingerprints byte-identically to one written before Phase 0.3.
+            **({} if self.source == "noise"
+               else {"source": self.source, "zoo_dir": self.zoo_dir}),
             "stacks": {
                 a: {
                     "family_idx": s.family_idx,
@@ -303,7 +507,17 @@ class EnsembleDataset:
                           ("exclude_1d", self.exclude_1d),
                           ("include_extra", self.include_extra),
                           ("seed", self.seed),
-                          ("mode", self.mode)):
+                          ("mode", self.mode),
+                          # .get default matches _save_meta's omission of the
+                          # default, so a pre-Phase-0.3 cache still loads.
+                          ("source", self.source)):
+            if key == "source":
+                if meta.get("source", "noise") != mine:
+                    raise RuntimeError(
+                        f"Refusing to reuse {self.ens_dir}: cached "
+                        f"source={meta.get('source', 'noise')!r} but this run asks "
+                        f"for {mine!r}. These are different ensembles.")
+                continue
             if meta.get(key) != mine:
                 raise RuntimeError(
                     f"Refusing to reuse {self.ens_dir}: cached {key}={meta.get(key)!r} "
@@ -374,41 +588,25 @@ class EnsembleDataset:
         """
         Return the ensemble restricted to one chunk: (n_samples, r1-r0) float32.
 
-        Row 0 is the real model (no noise). Rows 1.. are w0 + s*sigma*eps, with eps
-        regenerated deterministically from (seed, chunk_idx) — a single randn call
-        for the whole chunk, which is why this is fast enough to redo every pass.
+        Dispatches to `self._src` (NoiseSource or ZooSource). Everything above this
+        method -- the Gram accumulation, PCA, the flow -- is indifferent to which.
+
+        For source='noise': row 0 is the real model, rows 1.. are w0 + s*sigma*eps
+        regenerated deterministically from (seed, chunk_idx).
+        For source='zoo': row i is member i, read from disk. No row is privileged.
 
         w0_mm : pass the result of w0(arch) to avoid reopening the memmap per chunk.
+                Unused by ZooSource, which caches its own memmaps.
         """
-        st = self.stacks[arch]
         bounds = self.chunk_bounds(arch)
         if not (0 <= chunk_idx < len(bounds)):
             raise IndexError(f"chunk_idx {chunk_idx} out of range "
                              f"(0..{len(bounds) - 1}) for {arch}")
         r0, r1 = bounds[chunk_idx]
-        L = r1 - r0
 
-        if w0_mm is None:
+        if w0_mm is None and self.source == "noise":
             w0_mm = self.w0(arch)
-        # np.array (not ascontiguousarray) to force a writable copy: w0 is opened
-        # read-only via mmap and torch.from_numpy warns on non-writable buffers.
-        base = torch.from_numpy(np.array(w0_mm[r0:r1])).to(device)
-
-        # Written in place so peak memory is one (N, L) block rather than two --
-        # a repeat() plus a separate randn() would double the chunk budget.
-        out = torch.empty((self.n_samples, L), device=base.device, dtype=base.dtype)
-        out[0] = base                                  # sample 0 is the real model
-        if self.n_samples > 1:
-            if self.noise_scale > 0.0:
-                g = torch.Generator(device=out.device)
-                # Same grid + same seed => same ensemble on every pass.
-                g.manual_seed((self.seed * 1_000_003 + chunk_idx) % (2**63 - 1))
-                torch.randn((self.n_samples - 1, L), generator=g,
-                            device=out.device, dtype=out.dtype, out=out[1:])
-                out[1:].mul_(self.noise_scale * st.weight_std).add_(base)
-            else:
-                out[1:] = base
-        return out
+        return self._src.load_rows(self, arch, chunk_idx, r0, r1, device, w0_mm)
 
     # ------------------------------------------------------------------
     # Convenience
@@ -419,13 +617,20 @@ class EnsembleDataset:
         """
         Reconstruct ensemble member `idx` in full, (D,) float32. One streaming pass.
 
-        Needed because only sample 0 (= w_0) is on disk; every other member exists
-        only as a seed. Evaluating a TYPICAL member matters: sample 0 sits ~sqrt(N)
-        closer to the ensemble mean than a typical member, so a rank sweep measured
-        on sample 0 alone understates truncation loss badly.
+        For source='noise' only sample 0 is on disk and every other member exists
+        only as a seed, and sample 0 sits ~sqrt(N) closer to the ensemble mean than a
+        typical member -- so a rank sweep measured on sample 0 alone understates
+        truncation loss badly (misstep 9).
+
+        For source='zoo' every member is already a file, and no member is at a
+        privileged centre, so that warning does not apply and any index is
+        representative.
         """
         if not (0 <= idx < self.n_samples):
             raise IndexError(f"sample {idx} out of range (0..{self.n_samples - 1})")
+        if self.source == "zoo":
+            return np.array(np.load(self._src.member_path(arch, idx), mmap_mode="r"),
+                            dtype=np.float32)
         out = np.empty(self.stacks[arch].n_params, dtype=np.float32)
         w0_mm = self.w0(arch)
         for ci, (r0, r1) in enumerate(self.chunk_bounds(arch)):
@@ -438,7 +643,7 @@ class EnsembleDataset:
         return {a: s.family_idx for a, s in self.stacks.items()}
 
     def summary(self) -> str:
-        lines = [f"EnsembleDataset  N={self.n_samples}  "
+        lines = [f"EnsembleDataset  source={self.source}  N={self.n_samples}  "
                  f"noise_scale={self.noise_scale}  exclude_1d={self.exclude_1d}  "
                  f"include_extra={self.include_extra}"]
         for a in self.arch_list:

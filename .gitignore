@@ -24,11 +24,18 @@ env/
 *.npy
 *.npz
 
-# Large model / artifact directories — never commit these
-artifacts*/
-artifacts_local/
-results/
-runs/
+# Large model / artifact directories — never commit these.
+#
+# LEADING SLASHES ARE LOAD-BEARING. A gitignore pattern with no slash matches at
+# ANY DEPTH, so the unanchored `artifacts*/` also matched `src/llmzoo/artifacts/`
+# -- the library package. Already-tracked files are exempt, so nothing broke, but
+# a NEW file under src/llmzoo/artifacts/ would have been silently unstageable.
+# Exactly the trap that ate that directory via `rsync --exclude='artifacts*/'`
+# on 2026-09-08 (docs/PHASE1_HANDOFF.md §8 trap 2); same fix, same reason.
+/artifacts*/
+/artifacts_local/
+/results/
+/runs/
 
 # HPC scratch outputs (local mirror if any)
 /scratch/
@@ -51,3 +58,43 @@ slurm_*.err
 # Claude Code local state — machine-specific, and a stale scheduler lock lived
 # here dirtying `git status` for two months.
 .claude/
+
+# ---------------------------------------------------------------------------
+# SECRETS — defence in depth, not the primary mechanism.
+#
+# The real keys (WANDB_API_KEY, HF_TOKEN) live at ~/.config/llmzoo/env, mode
+# 600, which slurm/aicr_env.sh sources. That path is OUTSIDE this repo on
+# purpose, so git cannot see it no matter what these patterns say, and it is
+# outside /work/neu/p2026_0038_neu too because project space is setgid and
+# group-readable by collaborators.
+#
+# These patterns exist for the day someone drops a key in the repo anyway.
+# Note `env/` above matches a DIRECTORY only, so it never covered a `.env`
+# FILE. A token already leaked into a transcript once on 2026-09-03
+# (RESEARCH_NOTES §6 fact 7) and rotation is still outstanding.
+.env
+.env.*
+*.env
+.netrc
+.npmrc
+secrets/
+secrets.*
+*.pem
+*.key
+*_key
+*_token
+*_secret
+*credentials*
+.wandb
+wandb/
+# NOT ignored, and deliberately so: slurm/env_lock_aicr.txt is a `pip freeze`
+# with no secrets in it, and it is the record of which versions produced a
+# result. Keep it tracked.
+!slurm/env_lock_aicr.txt
+
+# Figure renders are regenerable from reports/*.py; don't commit 500 KB PNGs.
+reports/*.png
+# But DO keep the small inputs the figures are built from -- 11 eigenvalues per
+# arm, 216 bytes each. Without these `*.npy` above makes reports/ unbuildable
+# from a fresh clone.
+!reports/data/*.npy

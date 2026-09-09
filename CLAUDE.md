@@ -107,3 +107,62 @@ docs/           archive: RESEARCH_NOTES (missteps §5, environment §6), HANDOFF
 torch. `pip install -e .` is required — the tests and scripts import `llmzoo.*`, not
 sibling files. torch is deliberately **not** a declared dependency; it must come from
 the cu128 index first (see `slurm/setup_env_aicr.sh`).
+
+## The zoo (added 2026-09-08)
+
+`RESEARCH_PLAN.md` §4. Branch ~100 GPT-2s off one shared trunk; classes are
+pretraining data mixtures on the 5-simplex.
+
+```bash
+python scripts/train_zoo.py --verify_domains        # DO THIS FIRST, it is free
+python scripts/train_zoo.py --mode plan --arch gpt2_zoo_mini --n_members 12
+ARCH=gpt2_zoo_mini BETA=0.30 N_MEMBERS=12 sbatch slurm/zoo_trunk.sbatch
+ARCH=gpt2_zoo_mini BETA=0.30 N_MEMBERS=12 sbatch --array=0-11 slurm/zoo_branch.sbatch
+python scripts/eval_domains.py --arch gpt2_zoo_mini   # the §4.3 gate; exit 1 = stop
+TEST=tests/test_zoo.py sbatch slurm/tests.sbatch
+```
+
+**One GPU per array task, always.** Branches are independent, AICR nodes are shared,
+and a 1-GPU job backfills immediately where `--gres=gpu:8` waits for a node to drain.
+A member whose `w_<i>.npy` exists exits immediately, so a failed array is resubmitted
+verbatim.
+
+**The five HF dataset ids in `src/llmzoo/data/mixtures.py` are the most fragile thing
+in this repo.** Datasets get renamed and gated. `--verify_domains` finds that in
+seconds; a trunk job finds it 40 minutes in.
+
+**`eval_domains.py` is a gate, not a report.** It exits 1 when mixture identity is not
+measurable in the models themselves. The response is a LARGER `--beta` and a re-run —
+not a reframe, and not something to fix downstream. A flat spectrum measured on a zoo
+that failed this gate says nothing about weight space (RESEARCH_PLAN §4.3).
+
+**The gate measures DETECTABILITY, not generative difficulty — do not select β on it
+alone.** (2026-09-08) Its min-SNR is *maximised* by a tight within-anchor spread, which
+is exactly the regime where the ensemble mean is already a good model, `gauss_codes`
+is a strong null, and a flow can memorise the codes — misstep 19's mechanism, and
+nothing in `domain_separation.json` sees it. Use `scripts/diag_zoo_geometry.py`
+alongside: it reports displacement from the trunk, spread/displacement (√2 = members
+moved independently), the centroid fraction (√((N−1)/N/2) for an i.i.d. spread) and
+between/within distance in weight space. Measured at Mini N=12, β=0.15/0.30/0.60:
+between/within **degrades** 4.08 → 3.98 → 2.88 while displacement grows 16.5% → 28.7%
+→ 55.9%, so the largest β is worst on the statistic a PCA basis is built from.
+And β cannot fix memorisation anyway — §6.4's retrieval baseline is the control that
+answers it.
+
+**β is DECIDED at 0.30** (2026-09-08, `docs/PHASE1_HANDOFF.md` §5). All of
+0.15/0.30/0.60 passed the gate. 0.15 is what §4.3's "smallest passing" rule selects and
+is 434 GPU-hr cheaper; the override buys headroom for the singleton regime N=12 could
+not test. Do not re-open this without reading handoff §2b first.
+
+**`--alpha`, not `--min_l1_gap`, controls how close singleton mixtures land.**
+`min_l1_gap` only relaxes a rejection test and cannot cluster draws. Measured at n=6:
+alpha=1 → min pair L1 0.595, alpha=8 → 0.169. Phase 2's 80 singletons have a closest
+pair at 0.173, so a probe wanting Phase 2's hardest case needs `--alpha 8.0`.
+
+**Never size a conditioning table with `len(ARCH_CONFIGS)`.** It was `N_FAMILIES`
+until 2026-09-08, which meant registering an architecture silently reshaped every
+`nn.Embedding` and invalidated every checkpoint. Use `N_COND_SLOTS` (fixed at 32).
+`N_ARCHS` is the registry size and is informational.
+
+**Zoo runs use `exclude_1d=False`.** GPT-2 has biases on every projection; with
+`True` a generated model would inherit member 0's. Costs ~0.1% of `D`.

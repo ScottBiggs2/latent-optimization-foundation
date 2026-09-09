@@ -1,0 +1,28 @@
+{
+  "idx": 8,
+  "pi": [
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0
+  ],
+  "kind": "anchor",
+  "mixture_id": "anchor_math",
+  "branch": 0,
+  "weight_std": 0.056616976857185364,
+  "n_params": 51475968,
+  "peak_tflops": 1662.4,
+  "throughput": {
+    "tokens": 617611264,
+    "seconds": 2518.714,
+    "steady_seconds": 2508.931,
+    "startup_seconds": 9.783,
+    "tokens_per_sec": 247831.2,
+    "tokens_per_sec_avg": 246112.9,
+    "n_windows": 95,
+    "mfu": 0.046044334619315834,
+    "peak_tflops": 1662.4,
+    "final_loss": 3.329203873872757
+  }
+}

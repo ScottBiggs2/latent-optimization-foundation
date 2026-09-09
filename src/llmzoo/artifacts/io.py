@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import time
 from typing import Any, Dict, Optional
@@ -55,7 +56,11 @@ def atomic_write_json(path: str, payload: dict) -> None:
     """
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
+    # Hostname as well as PID. PIDs are unique per node, not across a shared
+    # filesystem, and a zoo branch array has every task writing the same
+    # zoo_meta.json from a different node -- so PID alone can collide and produce
+    # exactly the torn file this function exists to prevent.
+    tmp = f"{path}.tmp.{socket.gethostname()}.{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2, sort_keys=False, default=str)
     os.replace(tmp, path)
@@ -146,6 +151,16 @@ def ensemble_fingerprint(ens_meta: dict) -> str:
             for a, d in sorted(stacks.items())
         },
     }
+    # `zoo_dir` identifies WHICH zoo, and without it the three beta zoos of the
+    # §4.2 calibration all hash identically -- same N, same D, same layout, so
+    # provenance could not tell a beta=0.15 artifact from a beta=0.60 one.
+    #
+    # Added CONDITIONALLY, and that is the whole subtlety: a noise payload must
+    # stay byte-identical or every artifact already on disk goes stale. The
+    # historical noise hash is cdbb077e838a543f and
+    # tests/test_zoo.py::test_noise_source_fingerprint_unchanged is the guard.
+    if payload["source"] != "noise":
+        payload["zoo_dir"] = ens_meta.get("zoo_dir")
     return fingerprint(payload)
 
 

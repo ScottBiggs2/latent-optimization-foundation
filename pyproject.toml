@@ -17,14 +17,27 @@ requires-python = ">=3.11"
 #
 # slurm/setup_env_aicr.sh installs torch from download.pytorch.org/whl/cu128
 # FIRST, then runs `pip install -e .` for everything below.
+# UPPER BOUNDS ON transformers AND datasets ARE DELIBERATE.
+#
+# This code targets the transformers 4.x / datasets 2-3.x APIs. Unbounded, a
+# fresh `pip install -e .` resolves to transformers 5.x and datasets 5.x -- two
+# major versions of unrelated churn layered on top of code that had never
+# executed, which makes every traceback ambiguous between "our bug" and "v5
+# renamed it".
+#
+# datasets<4 also still supports loading-script datasets. We do not rely on that
+# (every id in data/mixtures.py is parquet-native and ungated, on purpose), but
+# it means a stale id fails with a clear error instead of a hard removal.
+#
+# Raise these on purpose, with a test run, not by deleting the bound.
 dependencies = [
     "numpy>=1.23.0",
     "scipy>=1.10.0",
     "scikit-learn>=1.2.0",
-    "transformers>=4.40.0",
+    "transformers>=4.57,<5",
     "accelerate>=0.27.0",
     "huggingface-hub>=0.20.0",
-    "datasets>=2.14.0",
+    "datasets>=3.6,<4",
     "tqdm>=4.65.0",
     "wandb>=0.17.0",
 ]

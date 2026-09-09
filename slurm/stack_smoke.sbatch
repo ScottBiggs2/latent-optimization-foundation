@@ -47,9 +47,20 @@ python -u scripts/eval_stack.py --artifact_dir "$ARTIFACT_DIR" --run_name "$RUN"
     --eval_seq_len 64 --eval_n_sequences 4 --no_wandb
 
 echo; echo "############ tiny mode must REFUSE a real benchmark ############"
-if python -u scripts/eval_stack.py --artifact_dir "$ARTIFACT_DIR" --run_name "$RUN" \
-       --mode tiny --k 11 --arms pca_only --bench mmlu --no_wandb 2>&1 \
-       | tee /dev/stderr | grep -q "Refusing --bench"; then
+# Capture first, then grep -- do NOT pipe the python call into grep.
+#
+# eval_stack refuses via `raise SystemExit(msg)`, which exits 1. Under the
+# `set -o pipefail` above, a pipeline's status is the last NON-ZERO status, so
+# `python ... | grep -q "Refusing"` returned 1 even when grep matched, and this
+# check reported FAIL for the exact behaviour it was asserting. The refusal has
+# been working the whole time; the assertion was inverted by pipefail.
+#
+# `|| true` because a non-zero exit is the EXPECTED outcome here.
+refusal=$(python -u scripts/eval_stack.py --artifact_dir "$ARTIFACT_DIR" \
+              --run_name "$RUN" --mode tiny --k 11 --arms pca_only \
+              --bench mmlu --no_wandb 2>&1 || true)
+echo "$refusal"
+if grep -q "Refusing --bench" <<< "$refusal"; then
     echo "  OK: refused as designed"
 else
     echo "  FAIL: tiny mode accepted a real benchmark"; exit 1

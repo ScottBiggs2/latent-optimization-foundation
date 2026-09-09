@@ -1,0 +1,19 @@
+{
+  "zoo_dir": "/work/neu/p2026_0038_neu/biggs_s_neu/llm_vae/zoo_b030/gpt2_zoo_mini",
+  "arch": "gpt2_zoo_mini",
+  "beta": 0.3,
+  "n_members": 12,
+  "D": 51475968,
+  "member_norm_mean": 410.84768359532467,
+  "pairwise_mean": 102.44343885058369,
+  "pairwise_min": 26.020781637731076,
+  "within_group_mean": 32.38060708336154,
+  "between_group_mean": 128.717000763292,
+  "between_over_within": 3.9751262362660262,
+  "to_mean_mean": 75.55513586090096,
+  "mean_frac": 0.737530257756185,
+  "trunk_norm": 406.6845085200334,
+  "to_trunk_mean": 116.71809884639104,
+  "disp_rel": 0.2869991268443939,
+  "spread_over_disp": 0.8776996872216555
+}

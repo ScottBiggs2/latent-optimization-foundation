@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from llmzoo.artifacts.io import (
     ensemble_fingerprint, pca_fingerprint, provenance_block, read_json,
 )
-from llmzoo.data.ensemble import EnsembleDataset
+from llmzoo.data.ensemble import ENSEMBLE_SOURCES, EnsembleDataset
 from llmzoo.pca.gram import DualGramPCA
 from llmzoo.models.registry import N_FAMILIES
 from llmzoo.artifacts.bundle import CodeStats, rebuild_manifest
@@ -349,6 +349,26 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--chunk_budget_mb", type=int, default=512)
 
+    # Where the members come from (Phase 0.3). The library has supported this
+    # since MemberSource landed; this driver did not, so there was no way to fit
+    # a PCA on a real zoo at all.
+    #
+    # A zoo run needs THREE flags together, and each is separately enforced:
+    #   --source zoo --zoo_dir <parent>  --noise_scale 0.0  --no_exclude_1d
+    # `--noise_scale 0.0` because EnsembleDataset refuses a zoo with augmentation
+    # noise, and `--no_exclude_1d` because train_zoo writes exclude_1d=False
+    # (§2.2: GPT-2 has biases everywhere and a generated model must not inherit
+    # member 0's) while this script defaults to True.
+    p.add_argument("--source", default="noise", choices=list(ENSEMBLE_SOURCES),
+                   help="'noise' = the manufactured ensemble (the beta->0 "
+                        "reference and the machinery test); 'zoo' = real "
+                        "branched models from scripts/train_zoo.py.")
+    p.add_argument("--zoo_dir", default=None,
+                   help="Required with --source zoo. This is the PARENT of the "
+                        "arch directory: members are read from "
+                        "<zoo_dir>/<arch>/w_<i>.npy. train_zoo.py's own "
+                        "--zoo_dir is the arch-level dir, one level down.")
+
     # Rank
     p.add_argument("--k", type=int, default=None,
                    help="Code dimension. Default N-1 (the rank bound).")
@@ -392,6 +412,8 @@ def main() -> None:
     print(f"  run       : {args.run_name}   -> {run_root}")
     print(f"  archs     : {args.arch_list}")
     print(f"  N         : {args.n_samples}   noise_scale={args.noise_scale}")
+    print(f"  source    : {args.source}"
+          + (f"   zoo_dir={args.zoo_dir}" if args.source != "noise" else ""))
     print(f"  k         : {k}  (rank bound is N-1 = {args.n_samples - 1})")
     print(f"  extra seg : include_extra={args.include_extra} "
           f"(embeddings / final norm / untied LM head)")
@@ -403,7 +425,8 @@ def main() -> None:
                          include_extra=args.include_extra,
                          mode=args.mode, artifact_dir=run_root, seed=args.seed,
                          chunk_budget_bytes=args.chunk_budget_mb * 1024 * 1024,
-                         force_extract=args.force_extract)
+                         force_extract=args.force_extract,
+                         source=args.source, zoo_dir=args.zoo_dir)
     print(ds.summary())
 
     print(f"\n{ts()} Stage 2: per-family Gram PCA")

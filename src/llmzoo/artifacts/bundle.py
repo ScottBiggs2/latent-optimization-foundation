@@ -371,6 +371,13 @@ def load_run(
             artifact_dir=run_root,
             seed=ens_meta["seed"],
             chunk_budget_bytes=ens_meta["chunk_budget_bytes"],
+            # Both default to a noise ensemble if omitted, and the cache gate
+            # then refuses the run with "cached source='zoo' but this run asks
+            # for 'noise'". Dropping them here made every downstream consumer --
+            # train_flow, eval_stack, both diag scripts -- unable to open a zoo
+            # run at all. Read from the recorded meta like everything else above.
+            source=ens_meta.get("source", "noise"),
+            zoo_dir=ens_meta.get("zoo_dir"),
         )
 
     # --- per-family PCA ---------------------------------------------------

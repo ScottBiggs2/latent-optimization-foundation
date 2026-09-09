@@ -28,8 +28,15 @@ if [ ! -d "$ENV_PATH" ]; then
 fi
 conda activate "$ENV_PATH"
 
-echo "### torch, cu128 (sm_100 / Blackwell)"
-pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+# PINNED, not floating. The cu128 index currently serves up to torch 2.11, but
+# 2.9.1+cu128 is the build already proven on these B200s inside this project
+# space, and a never-executed training loop is the wrong place to also be the
+# first user of a new torch. It has sm_100; the assert below still checks.
+TORCH_VERSION="${TORCH_VERSION:-2.9.1}"
+
+echo "### torch $TORCH_VERSION, cu128 (sm_100 / Blackwell)"
+pip install --index-url https://download.pytorch.org/whl/cu128 \
+    "torch==$TORCH_VERSION" torchvision
 
 echo "### llmzoo + the rest, editable"
 pip install -e "$CODE_DIR"
@@ -38,15 +45,37 @@ echo "### verify"
 python - <<'PY'
 import torch
 print("torch      ", torch.__version__, "cuda", torch.version.cuda)
-# get_arch_list() reads the COMPILED kernel set and works with no GPU attached,
-# which is exactly what we need to check on a login node.
-caps = torch.cuda.get_arch_list()
-print("arch list  ", caps)
-assert any("sm_100" in c for c in caps), \
-    f"this torch has no sm_100 kernels and will fail on a B200: {caps}"
+
+# Read the compiled kernel set WITHOUT a GPU attached, which is the whole point
+# of checking here on the login node.
+#
+# torch.cuda.get_arch_list() is the obvious call and it is the WRONG one: as of
+# torch 2.9 it opens with `if not is_available(): return []`, so on a login node
+# it returns an empty list and an `sm_100 in caps` assertion fails for a
+# perfectly good cu128 build. That false negative cost a cycle here on
+# 2026-09-07. The private binding underneath reads a compile-time string and
+# needs no driver, no device and no CUDA init.
+caps = torch._C._cuda_getArchFlags()
+print("arch flags ", caps)
+assert caps and "sm_100" in caps.split(), \
+    f"this torch has no sm_100 kernels and will fail on a B200: {caps!r}"
+print("sm_100     ", "present (B200 / Blackwell OK)")
+import transformers, datasets, numpy
+print("transformers", transformers.__version__)
+print("datasets    ", datasets.__version__)
+print("numpy       ", numpy.__version__)
+assert transformers.__version__.startswith("4."), \
+    f"pyproject pins transformers<5; got {transformers.__version__}"
+assert datasets.__version__.startswith("3."), \
+    f"pyproject pins datasets<4; got {datasets.__version__}"
 import llmzoo
 print("llmzoo     ", llmzoo.__file__)
 PY
+
+# Lock file, so "which versions produced this result" is answerable later. /work,
+# not /scratch: scratch is purged at 30 days and this outlives the sprint.
+pip freeze > "$CODE_DIR/slurm/env_lock_aicr.txt"
+echo "### locked -> $CODE_DIR/slurm/env_lock_aicr.txt"
 
 cat <<MSG
 
