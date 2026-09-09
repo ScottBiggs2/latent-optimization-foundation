@@ -1,0 +1,508 @@
+{
+  "layout_version": 2,
+  "arch": "gpt2_zoo_mini",
+  "n_members": 26,
+  "beta": 0.15,
+  "exclude_1d": false,
+  "include_extra": true,
+  "tokens_per_param": 20,
+  "plan_seed": 0,
+  "alpha": 8.0,
+  "min_l1_gap": 0.15,
+  "n_anchor_branches": 4,
+  "total_steps": 7854,
+  "trunk_steps": 6676,
+  "trunk_seed": 1234,
+  "domains": [
+    "web",
+    "code",
+    "math",
+    "books",
+    "multilingual"
+  ],
+  "members": [
+    {
+      "idx": 0,
+      "pi": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_web",
+      "branch": 0
+    },
+    {
+      "idx": 1,
+      "pi": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_web",
+      "branch": 1
+    },
+    {
+      "idx": 2,
+      "pi": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_web",
+      "branch": 2
+    },
+    {
+      "idx": 3,
+      "pi": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_web",
+      "branch": 3
+    },
+    {
+      "idx": 4,
+      "pi": [
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_code",
+      "branch": 0
+    },
+    {
+      "idx": 5,
+      "pi": [
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_code",
+      "branch": 1
+    },
+    {
+      "idx": 6,
+      "pi": [
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_code",
+      "branch": 2
+    },
+    {
+      "idx": 7,
+      "pi": [
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_code",
+      "branch": 3
+    },
+    {
+      "idx": 8,
+      "pi": [
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_math",
+      "branch": 0
+    },
+    {
+      "idx": 9,
+      "pi": [
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_math",
+      "branch": 1
+    },
+    {
+      "idx": 10,
+      "pi": [
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_math",
+      "branch": 2
+    },
+    {
+      "idx": 11,
+      "pi": [
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_math",
+      "branch": 3
+    },
+    {
+      "idx": 12,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_books",
+      "branch": 0
+    },
+    {
+      "idx": 13,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_books",
+      "branch": 1
+    },
+    {
+      "idx": 14,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_books",
+      "branch": 2
+    },
+    {
+      "idx": 15,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_books",
+      "branch": 3
+    },
+    {
+      "idx": 16,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_multilingual",
+      "branch": 0
+    },
+    {
+      "idx": 17,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_multilingual",
+      "branch": 1
+    },
+    {
+      "idx": 18,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_multilingual",
+      "branch": 2
+    },
+    {
+      "idx": 19,
+      "pi": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "kind": "anchor",
+      "mixture_id": "anchor_multilingual",
+      "branch": 3
+    },
+    {
+      "idx": 20,
+      "pi": [
+        0.19265377643790835,
+        0.2301283415444251,
+        0.15078360378168776,
+        0.2852238050749172,
+        0.1412104731610615
+      ],
+      "kind": "singleton",
+      "mixture_id": "dirichlet_000",
+      "branch": 0
+    },
+    {
+      "idx": 21,
+      "pi": [
+        0.21096924534952544,
+        0.09954466680518562,
+        0.1637242693322404,
+        0.21754522751046465,
+        0.3082165910025839
+      ],
+      "kind": "singleton",
+      "mixture_id": "dirichlet_001",
+      "branch": 0
+    },
+    {
+      "idx": 22,
+      "pi": [
+        0.20328866660785824,
+        0.16583699390079085,
+        0.2903687213868611,
+        0.16079087776162101,
+        0.17971474034286872
+      ],
+      "kind": "singleton",
+      "mixture_id": "dirichlet_002",
+      "branch": 0
+    },
+    {
+      "idx": 23,
+      "pi": [
+        0.1414132555020918,
+        0.19683983858949045,
+        0.22520137195807985,
+        0.16312343197521428,
+        0.2734221019751237
+      ],
+      "kind": "singleton",
+      "mixture_id": "dirichlet_003",
+      "branch": 0
+    },
+    {
+      "idx": 24,
+      "pi": [
+        0.09108705821063819,
+        0.2340237711364535,
+        0.16385028755381797,
+        0.2422757545754269,
+        0.2687631285236635
+      ],
+      "kind": "singleton",
+      "mixture_id": "dirichlet_004",
+      "branch": 0
+    },
+    {
+      "idx": 25,
+      "pi": [
+        0.12737118341554113,
+        0.2649074742808436,
+        0.168264435505124,
+        0.25276525801541294,
+        0.18669164878307834
+      ],
+      "kind": "singleton",
+      "mixture_id": "dirichlet_005",
+      "branch": 0
+    }
+  ],
+  "holdout": {
+    "interior": [
+      22,
+      23,
+      20,
+      25
+    ],
+    "vertex": [
+      8,
+      9,
+      10,
+      11
+    ],
+    "train": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      21,
+      24
+    ]
+  },
+  "n_layers": 8,
+  "block_size": 3152384,
+  "extra_size": 26256896,
+  "n_params": 51475968,
+  "weight_std": 0.05609840899705887,
+  "schema": [
+    [
+      "ln_1.weight",
+      [
+        512
+      ]
+    ],
+    [
+      "ln_1.bias",
+      [
+        512
+      ]
+    ],
+    [
+      "attn.c_attn.weight",
+      [
+        512,
+        1536
+      ]
+    ],
+    [
+      "attn.c_attn.bias",
+      [
+        1536
+      ]
+    ],
+    [
+      "attn.c_proj.weight",
+      [
+        512,
+        512
+      ]
+    ],
+    [
+      "attn.c_proj.bias",
+      [
+        512
+      ]
+    ],
+    [
+      "ln_2.weight",
+      [
+        512
+      ]
+    ],
+    [
+      "ln_2.bias",
+      [
+        512
+      ]
+    ],
+    [
+      "mlp.c_fc.weight",
+      [
+        512,
+        2048
+      ]
+    ],
+    [
+      "mlp.c_fc.bias",
+      [
+        2048
+      ]
+    ],
+    [
+      "mlp.c_proj.weight",
+      [
+        2048,
+        512
+      ]
+    ],
+    [
+      "mlp.c_proj.bias",
+      [
+        512
+      ]
+    ]
+  ],
+  "extra_schema": [
+    [
+      "transformer.wte.weight",
+      [
+        50257,
+        512
+      ]
+    ],
+    [
+      "transformer.wpe.weight",
+      [
+        1024,
+        512
+      ]
+    ],
+    [
+      "transformer.ln_f.weight",
+      [
+        512
+      ]
+    ],
+    [
+      "transformer.ln_f.bias",
+      [
+        512
+      ]
+    ]
+  ]
+}
