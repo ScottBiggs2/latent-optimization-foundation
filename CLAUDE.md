@@ -149,10 +149,29 @@ between/within **degrades** 4.08 → 3.98 → 2.88 while displacement grows 16.5
 And β cannot fix memorisation anyway — §6.4's retrieval baseline is the control that
 answers it.
 
-**β is DECIDED at 0.30** (2026-09-08, `docs/PHASE1_HANDOFF.md` §5). All of
-0.15/0.30/0.60 passed the gate. 0.15 is what §4.3's "smallest passing" rule selects and
-is 434 GPU-hr cheaper; the override buys headroom for the singleton regime N=12 could
-not test. Do not re-open this without reading handoff §2b first.
+**β is DECIDED at 0.15** (2026-09-09, `docs/PHASE2_RESULTS.md` §6). This supersedes
+the 2026-09-08 decision of 0.30. The k=99 spectrum at N=100 did **not** discriminate
+(`effective_rank_ratio` 0.0451 vs 0.0452 whole-stack, 0.0727 vs 0.0738 block-only), so
+§4.3's smallest-passing rule selects 0.15, and the sole reason for the earlier override
+— headroom for the singleton regime N=12 could not test — has now been tested and passed
+5/5. Saves ~417 GPU-hr across Small and Medium. The cost: β=0.30's probe slope is 2.1×
+stronger, i.e. more conditioning signal. Do not re-open without reading RESULTS §6.
+
+**`effective_rank_ratio` is NOT k-invariant — quote the absolute `effective_rank`, or
+state k.** (2026-09-09) It divides by k while the effective rank barely moves, so it
+scales as ~1/k. Measured on ONE set of eigenvalues, β=0.15 blocks-only: ratio 0.073 at
+k=99, 0.116 at k=50, **0.199 at k=25**, 0.435 at k=10, while the rank goes 7.20 → 5.79 →
+4.98 → 4.35. So §4.4's "0.2–0.3" is satisfied or missed purely by choice of k, and the
+plan never states one. This is misstep 15b again, in the statistic adopted to *fix*
+misstep 15b. `scripts/diag_block_spectrum.py` emits the sweep by default.
+
+**The leading structure is ≈ dim(Δ⁴) = 4.** (2026-09-09) At Mini N=100 the embeddings
+measure effective rank 4.03 / 3.98 — the mixture simplex dimension to within 0.05 — and
+the blocks 7.20 / 7.31. A class is a point on Δ⁴, so between-mixture structure can span
+at most 4 dimensions however many distinct π are drawn. Not a rank-4 claim: 18% of
+embedding and 32% of block variance lie beyond c4. Consequence: 100 members in a
+~4.5-dimensional manifold is §11's memorisation regime, so **§6.4's retrieval baseline
+(not yet built) is the control that decides any generative result.**
 
 **`--alpha`, not `--min_l1_gap`, controls how close singleton mixtures land.**
 `min_l1_gap` only relaxes a rejection test and cannot cluster draws. Measured at n=6:

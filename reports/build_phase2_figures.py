@@ -43,6 +43,30 @@ def sep_of(ds):
     return ((ds or {}).get("verdict") or {}).get("separation") or {}
 
 
+KS = (99, 50, 25, 10)
+
+
+def k_sweep(evals):
+    """The same eigenvalues read at several k.
+
+    effective_rank_ratio normalises by k while the effective rank itself is
+    nearly k-invariant, so the ratio scales as ~1/k. Carrying the sweep keeps
+    anyone from quoting a single ratio as if it were a property of the data.
+    """
+    out = {}
+    for k in KS:
+        ev = [max(e, 1e-300) for e in evals[:k]]
+        if not ev:
+            continue
+        s1, s2 = sum(ev), sum(e * e for e in ev)
+        eff = (s1 * s1) / s2
+        med = statistics.median(ev)
+        out[str(k)] = {"ev0_over_median": ev[0] / med,
+                       "effective_rank": eff,
+                       "effective_rank_ratio": eff / len(ev)}
+    return out
+
+
 def cumvar(evals):
     tot = sum(evals) or 1.0
     out, acc = [], 0.0
@@ -81,6 +105,7 @@ def build():
                 "effective_rank_ratio": r.get("spectrum_effective_rank_ratio"),
                 "variance_share": r.get("variance_share_of_whole"),
                 "cumvar": cumvar(r.get("evals") or []),
+                "k_sweep": k_sweep(r.get("evals") or []),
             }
         # the same three regions at N=12, for the "design ceiling lifted" contrast
         regions12 = {}

@@ -101,6 +101,15 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--zoo_dir", required=True, help="the ARCH-level dir")
     p.add_argument("--k", type=int, default=None, help="default N-1")
+    p.add_argument("--k_list", type=int, nargs="*", default=None,
+                   help="also report the statistics at these k. Defaults to "
+                        "[k, k//2, k//4]. This is NOT decoration: "
+                        "effective_rank_ratio divides by k while the effective "
+                        "rank itself barely moves, so the ratio scales roughly "
+                        "as 1/k -- measured 0.045 at k=99 and 0.343 at k=10 on "
+                        "the SAME eigenvalues. Quoting it without k is the same "
+                        "defect as misstep 15b, in the statistic adopted to fix "
+                        "misstep 15b.")
     p.add_argument("--chunk_bytes", type=float, default=1.5e9)
     p.add_argument("--json_out", default=None)
     args = p.parse_args()
@@ -147,15 +156,19 @@ def main() -> int:
         "regions": {},
     }
     tr_whole = float(np.trace(centred(regions["whole_stack"])))
+    ks = args.k_list or sorted({k, max(k // 2, 2), max(k // 4, 2)}, reverse=True)
+    out["k_list"] = ks
     for name, G in regions.items():
         C = centred(G)
         ev = evals_desc(C)
         st = spectrum_stats(ev, k)
+        sweep = {str(kk): spectrum_stats(ev, kk) for kk in ks}
         tr = float(np.trace(C))
         out["regions"][name] = {
             **{f"spectrum_{a}": b for a, b in st.items()},
             "trace": tr,
             "variance_share_of_whole": tr / tr_whole if tr_whole else None,
+            "k_sweep": sweep,
             "evals": ev[:k].tolist(),
         }
 
@@ -173,8 +186,19 @@ def main() -> int:
     print(f"  and carries "
           f"{100 * (out['regions']['embeddings_only']['variance_share_of_whole'] or 0):.1f}% "
           f"of the variance.")
-    print(f"\n  Gate on ev0/median and eff_rank_ratio. NOT on ev0/ev[k-1], which")
-    print(f"  reads 12.09 at k=N-1 on data whose true ratio is 1.01 (misstep 15b).")
+    print(f"\n  k-sweep -- the SAME eigenvalues read at different k:")
+    print(f"  {'region':<18} {'k':>4} {'ev0/median':>11} {'eff_rank':>9} "
+          f"{'eff_rank_ratio':>15}")
+    for name in ("whole_stack", "block_only", "embeddings_only"):
+        for kk in ks:
+            st = out["regions"][name]["k_sweep"][str(kk)]
+            print(f"  {name if kk == ks[0] else '':<18} {kk:>4} "
+                  f"{st['ev0_over_median']:>11.2f} {st['effective_rank']:>9.3f} "
+                  f"{st['effective_rank_ratio']:>15.4f}")
+    print(f"\n  effective_rank_ratio divides by k, and the effective rank barely")
+    print(f"  moves, so the RATIO scales roughly as 1/k. Report the absolute")
+    print(f"  effective rank, or always state k. Gate on ev0/median and")
+    print(f"  eff_rank -- never on ev0/ev[k-1] (misstep 15b).")
 
     dest = args.json_out or os.path.join(args.zoo_dir, "block_spectrum.json")
     with open(dest, "w") as f:
