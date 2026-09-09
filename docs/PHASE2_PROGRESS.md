@@ -229,6 +229,49 @@ than anchors — 5-way interleave plus ~3 min of shuffle-buffer fill):
 
 ---
 
+### 3.1 The wall-clock assumption in §4.6 is wrong, and not by a little
+
+RESEARCH_PLAN §4.6 costs every zoo at **32 concurrent** ("100 branches run in 4
+waves"), and handoff §4 inherits it. That is our QOS *ceiling*, not our throughput.
+Measured at launch, 2026-09-08 22:5x:
+
+```
+b200-batch : 248 GPUs, 222 allocated, 2 more nodes drain* (Dell hardware cases)
+             -> ~10 genuinely schedulable
+             165 pending jobs, priority 698-882
+our priority: 135, ALL of it fairshare (Age contributes 0)
+our account : RawShares=1, NormShares=0.0082, EffectvUsage=0.0043
+concurrency we actually got: 3
+rtx-batch  : 152 GPUs, 152 allocated, 0 free, 52 pending
+```
+
+So we are **priority-starved, not resource-starved**, and the levers are backfill
+ones, not sizing ones:
+
+1. **Honest `--time`.** The committed 60 min against measured maxima of 15:49 (β=0.15)
+   and 27:00 (β=0.30) forfeited every backfill gap shorter than an hour
+   (`SchedulerType=sched/backfill`; skill Rule 3). Cut to 28 and 42 min on the
+   in-flight arrays via `scontrol update TimeLimit=`, which works on *pending* array
+   tasks and is permission-denied on running ones (handoff §8 trap 4).
+2. **Honest `--mem`.** `--mem=200G` against a measured MaxRSS of 16.1–17.8 GB. Slurm
+   must find the whole request free on one node, so that reservation could not be
+   placed on a node with a free GPU and 150 GB free. Cut to 96 GB, in the committed
+   sbatch and on the pending tasks. `--cpus-per-task` went 16 → 8 (AveCPU ≈ 0.87
+   cores: the tokenizer is single-threaded in the training thread).
+
+**Considered and rejected:** `b200-devel` has 8 free B200s and would satisfy trap 6,
+but our cap there is 2 GPUs and 35 jobs were already pending on a partition intended
+for short sanity checks. Going 3 → 5 concurrent does not change the character of the
+timeline and would be poor citizenship. `rtx-batch` is both full and a *different* GPU
+type, so it would violate trap 6 for a zoo whose members 0–11 are already b200.
+
+**What this means for Small and Medium.** Their GPU-hour costs (137 and 726) stand —
+those are measured. What does not stand is any wall-clock figure derived from 32
+concurrent. Medium at 3 concurrent is **10 days**, not 28 hours. Before committing to
+Medium, re-measure the achievable concurrency, and note that the fix is a fairshare
+conversation with the cluster owners rather than anything in this repo: our account
+holds 1 RawShare and our priority is 135 against a field at 698–882.
+
 ## 4. Traps found this session, all now in CLAUDE.md
 
 1. **A singleton mixture opens FIVE HF streams; an anchor opens one.** The very first
