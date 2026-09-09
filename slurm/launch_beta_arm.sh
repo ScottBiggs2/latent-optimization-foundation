@@ -95,6 +95,17 @@ GATE_EXTRA="${GATE_EXTRA:-}"
 # needs a different denominator, though the ktok/s stands either way.
 PARTITION="${PARTITION:-b200-batch}"
 
+# Nodes to keep off. NOT a scheduling optimisation -- --nodelist and --exclusive
+# are banned for that reason (skill Rule 2) -- but a genuinely faulty node has to
+# be excludable. a0016 on rtx-batch threw `CUDA error: uncorrectable ECC error
+# encountered` on three separate jobs across 2026-09-08/09 (a probe gate, then
+# gate_b015 and spec_b015 in the same minute) and Slurm had not drained it. Set
+# EXCLUDE_NODES= to clear this once it is fixed, and report it to the admins
+# rather than routing around it forever.
+EXCLUDE_NODES="${EXCLUDE_NODES:-a0016}"
+EXC=()
+[ -n "$EXCLUDE_NODES" ] && EXC=(--exclude="$EXCLUDE_NODES")
+
 LAST=$((N_MEMBERS - 1))
 K=$((N_MEMBERS - 1))
 # Which array indices to submit. The default submits every member, which is the
@@ -115,6 +126,7 @@ echo " partition     : $PARTITION"
 echo " walltimes     : trunk=$TRUNK_TIME  branch=$BRANCH_TIME  spec=$SPEC_TIME"
 echo " array         : $ARRAY   ($THROTTLE at a time -> ~$WAVES wave(s))"
 echo " skip trunk    : $SKIP_TRUNK"
+echo " exclude nodes : ${EXCLUDE_NODES:-<none>}"
 echo "=================================================================="
 
 cd "$CODE_DIR"
@@ -162,7 +174,7 @@ else
   t=$(ZOO_ROOT="$ZOO_ROOT" ARCH="$ARCH" BETA="$BETA" N_MEMBERS="$N_MEMBERS" \
       EXTRA="$EXTRA" \
       sbatch --parsable --partition="$PARTITION" --time="$TRUNK_TIME" \
-             --job-name="trunk_$TAG" \
+             --job-name="trunk_$TAG" "${EXC[@]}" \
              slurm/zoo_trunk.sbatch)
   echo "trunk      : $t"
 fi
@@ -177,7 +189,7 @@ b=$(ZOO_ROOT="$ZOO_ROOT" ARCH="$ARCH" BETA="$BETA" N_MEMBERS="$N_MEMBERS" \
     EXTRA="$EXTRA" \
     sbatch --parsable --partition="$PARTITION" --time="$BRANCH_TIME" \
            --job-name="branch_$TAG" \
-           --array="$ARRAY%$THROTTLE" "${DEP[@]}" \
+           --array="$ARRAY%$THROTTLE" "${DEP[@]}" "${EXC[@]}" \
            slurm/zoo_branch.sbatch)
 echo "branches   : $b  (array $ARRAY%$THROTTLE, ~$WAVES wave(s))"
 
@@ -185,6 +197,7 @@ echo "branches   : $b  (array $ARRAY%$THROTTLE, ~$WAVES wave(s))"
 # the b200 ceiling and runs alongside the next beta's training.
 g=$(ZOO_ROOT="$ZOO_ROOT" ARCH="$ARCH" EXTRA="$GATE_EXTRA" \
     sbatch --parsable --job-name="gate_$TAG" --dependency="afterok:$b" \
+           "${EXC[@]}" \
            slurm/eval_domains.sbatch)
 echo "gate       : $g  (rtx-batch, exit 1 = gate fired)"
 
@@ -198,6 +211,7 @@ echo "gate       : $g  (rtx-batch, exit 1 = gate fired)"
 # Medium all write runs/zoo_b030_k99 and the later fits would have silently
 # overwritten the earlier ones.
 s=$(sbatch --parsable --job-name="spec_$TAG" --dependency="afterok:$b" \
+           "${EXC[@]}" \
            --account=p2026_0038_neu --partition=rtx-batch --nodes=1 --gres=gpu:1 \
            --cpus-per-task=8 --mem=200G --time="$SPEC_TIME" \
            --output="/scratch/$USER/logs/spec_$TAG-%j.out" \
