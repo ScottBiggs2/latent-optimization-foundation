@@ -22,13 +22,31 @@
 # Re-running is safe and cheap: a member whose w_<i>.npy already exists exits
 # immediately, so a partially-failed array is resubmitted verbatim.
 
+# RESOURCE SHAPE, MEASURED rather than guessed (2026-09-08, sacct on 12 probe
+# branches). The committed request had been --cpus-per-task=16 --mem=200G:
+#
+#   MaxRSS   16.1-17.8 GB   -> 200G was 12x over
+#   AveCPU   ~0.87 cores    -> the data path tokenizes one document at a time,
+#                              synchronously, in the training thread, so 16 CPUs
+#                              was ~16x over
+#
+# This is not just tidiness. Slurm must find the WHOLE request free on one node,
+# so a 200 GB reservation cannot be placed on a node with a free GPU and 150 GB
+# free -- backfill lost for nothing (aicr-cluster skill, Rule 1). And 32
+# concurrent tasks reserved 6.4 TB against a 2.3 TB node, on a fairshare account
+# shared with two collaborators.
+#
+# 96G is 5.4x Mini's observed peak and still covers Medium, whose extra cost is
+# bounded: the model (1.42 GB), Adam's two moments, and the flattened w (1.42 GB)
+# -- the 5 x 10k-document shuffle buffers dominate and do not scale with the
+# model. Raise it if a Medium branch ever OOMs; do not raise it pre-emptively.
 #SBATCH --job-name=zoo_branch
 #SBATCH --account=p2026_0038_neu
 #SBATCH --partition=b200-batch
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=200G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
 #SBATCH --time=01:00:00
 #SBATCH --output=/scratch/%u/logs/%x-%A_%a.out
 #SBATCH --error=/scratch/%u/logs/%x-%A_%a.err
