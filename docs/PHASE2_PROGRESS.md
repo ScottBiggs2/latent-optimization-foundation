@@ -265,12 +265,28 @@ for short sanity checks. Going 3 → 5 concurrent does not change the character 
 timeline and would be poor citizenship. `rtx-batch` is both full and a *different* GPU
 type, so it would violate trap 6 for a zoo whose members 0–11 are already b200.
 
-**What this means for Small and Medium.** Their GPU-hour costs (137 and 726) stand —
-those are measured. What does not stand is any wall-clock figure derived from 32
-concurrent. Medium at 3 concurrent is **10 days**, not 28 hours. Before committing to
-Medium, re-measure the achievable concurrency, and note that the fix is a fairshare
-conversation with the cluster owners rather than anything in this repo: our account
-holds 1 RawShare and our priority is 135 against a field at 698–882.
+**Then the fix worked, and the diagnosis needs correcting.** Within one scheduling
+cycle of shrinking `--time` and `--mem`, concurrency went **3 → 29** and β=0.15
+reached 68/100 members. So the starvation was **mostly self-inflicted, not fairshare**:
+a 60-minute, 200 GB reservation is unbackfillable, and low priority only bites hard
+when you are also asking for more than a gap can hold. Priority 135 against a field at
+698–882 is real, but with an honest request the account still reaches near its 32-GPU
+ceiling.
+
+**What this means for Small and Medium.** The GPU-hour costs (137 and 726) stand —
+those are measured. The wall-clock figures derived from 32 concurrent are recoverable
+*provided the request is honest*, which the committed sbatch now is. Two caveats before
+Medium:
+
+- Medium's branch is 426 min, so `BRANCH_TIME` must be ~09:00:00 and that is
+  intrinsically far less backfillable than a 28-minute job. Expect concurrency well
+  below 32 for Medium no matter how the request is shaped — the lever that worked here
+  does not transfer to a 7-hour task.
+- Re-measure concurrency at Small (80 min/branch) before extrapolating to Medium. Small
+  is the intermediate data point and it is cheap to observe.
+
+Do not read the 3-concurrent snapshot as an argument for a fairshare conversation. Read
+it as the cost of asking for 60 minutes and 200 GB to run a 16-minute, 18 GB job.
 
 ## 4. Traps found this session, all now in CLAUDE.md
 
