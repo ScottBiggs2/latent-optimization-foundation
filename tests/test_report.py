@@ -526,6 +526,20 @@ def test_stdlib_purity() -> None:
     check("sys.modules has no numpy after importing report_stack",
           "numpy" not in sys.modules)
 
+    # The same contract, for the same reason, on every other reporting script.
+    # report_retrieval.py is §6.4's control -- the arm that decides whether any
+    # generative number means anything -- so it must never become the reason a
+    # report needs a GPU.
+    here = os.path.dirname(os.path.abspath(rs.__file__))
+    for name in ("report_retrieval.py", "report_singleton_probe.py",
+                 "report_beta_calibration.py"):
+        path = os.path.join(here, name)
+        if not os.path.exists(path):
+            continue
+        body = open(path).read()
+        for mod in ("numpy", "torch", "transformers", "llmzoo"):
+            check(f"{name} does not import {mod}", f"import {mod}" not in body)
+
 
 def main() -> int:
     test_parse_key()

@@ -257,20 +257,67 @@ class FlowVelocityNet(nn.Module):
     cond_proj, a learned null_cond, and conditioning dropout at train time. The 12
     duplicated lines are deliberate -- factoring them into a shared mixin would mean
     editing StackVAE's class hierarchy, and that risk is not worth the saving.
+
+    Two conditioning modes
+    ----------------------
+    `cond_mode="family"` (default) is the original: a discrete `nn.Embedding` row per
+    family. `cond_mode="pi"` replaces the lookup with a small MLP over a CONTINUOUS
+    vector -- the pretraining data mixture pi on the 5-simplex (RESEARCH_PLAN 6.2).
+
+    Everything after the encoder is byte-identical between the two. `cond_proj`,
+    `null_cond`, the conditioning dropout and all of `forward_cfg` act on the
+    post-projection (B, cond_dim) tensor and never see the label, which is why
+    classifier-free guidance carries over to a continuous condition unchanged
+    (Ho & Salimans, https://arxiv.org/abs/2207.12598). The encoder-MLP pattern is
+    FiLM's (Perez et al., https://arxiv.org/abs/1709.07871); DiT uses the same shape
+    for its timestep/label embedder (https://arxiv.org/abs/2212.09748).
+
+    Why this is not cosmetic: in a single-architecture zoo EVERY member shares one
+    `family_idx`, so `cond_mode="family"` is literally unconditional there. The two
+    modes are therefore each other's control -- same codes, same net size, same
+    epochs, conditioning present or absent.
+
+    What does NOT become pi: `family_idx` stays the discrete key for CodeStats'
+    per-family normalization and for the VAE's, so it is still threaded everywhere.
+    Only the conditioning input changes.
+
+    The hazard to keep in view (CcGAN, https://arxiv.org/abs/2011.07466): with a
+    continuous condition there may be exactly ONE real sample at any given label.
+    Phase 2's zoo has 85 distinct pi over 100 members, and each of the 80 singletons
+    is seen once, so pi is very nearly a unique key and the net can memorise a point
+    mass per mixture. That is what 6.4's retrieval baseline exists to detect.
     """
+
+    COND_MODES = ("family", "pi")
 
     def __init__(self, dim: int, n_families: int = N_FAMILIES, cond_dim: int = 64,
                  hidden_dims: Sequence[int] = (256, 512, 256),
-                 time_embed_dim: int = 64, cond_dropout_p: float = 0.15):
+                 time_embed_dim: int = 64, cond_dropout_p: float = 0.15,
+                 cond_mode: str = "family", pi_dim: int = 5):
         super().__init__()
+        if cond_mode not in self.COND_MODES:
+            raise ValueError(
+                f"unknown cond_mode {cond_mode!r} (expected one of {self.COND_MODES})")
         self.dim = int(dim)
         self.n_families = int(n_families)
         self.cond_dim = int(cond_dim)
         self.hidden_dims = tuple(int(h) for h in hidden_dims)
         self.time_embed_dim = int(time_embed_dim)
         self.cond_dropout_p = float(cond_dropout_p)
+        self.cond_mode = str(cond_mode)
+        self.pi_dim = int(pi_dim)
 
-        self.family_emb = nn.Embedding(n_families, cond_dim)
+        # Exactly ONE encoder is built. load_state_dict is strict by default, so a
+        # meta that disagrees with its weights fails loudly instead of quietly
+        # carrying an unused, untrained module.
+        if self.cond_mode == "pi":
+            if self.pi_dim < 1:
+                raise ValueError(f"cond_mode='pi' needs pi_dim >= 1, got {pi_dim}")
+            self.pi_mlp = nn.Sequential(
+                nn.Linear(self.pi_dim, cond_dim), nn.SiLU(),
+                nn.Linear(cond_dim, cond_dim))
+        else:
+            self.family_emb = nn.Embedding(n_families, cond_dim)
         self.cond_proj = nn.Sequential(nn.Linear(cond_dim, cond_dim), nn.SiLU())
         self.null_cond = nn.Parameter(torch.zeros(cond_dim))
         self.time_mlp = nn.Sequential(
@@ -290,11 +337,36 @@ class FlowVelocityNet(nn.Module):
         return {"dim": self.dim, "n_families": self.n_families,
                 "cond_dim": self.cond_dim, "hidden_dims": list(self.hidden_dims),
                 "time_embed_dim": self.time_embed_dim,
-                "cond_dropout_p": self.cond_dropout_p}
+                "cond_dropout_p": self.cond_dropout_p,
+                "cond_mode": self.cond_mode, "pi_dim": self.pi_dim}
+
+    def _encode_cond(self, family_idx: torch.Tensor,
+                     pi: Optional[torch.Tensor]) -> torch.Tensor:
+        """The ONLY place the two modes differ. Both return (B, cond_dim)."""
+        if self.cond_mode == "pi":
+            if pi is None:
+                raise ValueError(
+                    "this net is pi-conditioned (cond_mode='pi') but no pi= was "
+                    "passed. Sampling would silently fall back to a label the net "
+                    "never learned.")
+            if pi.shape[-1] != self.pi_dim:
+                raise ValueError(
+                    f"pi has width {pi.shape[-1]} but this net was built for "
+                    f"pi_dim={self.pi_dim}. A mixture vector whose domains do not "
+                    f"line up is worse than none.")
+            return self.pi_mlp(pi.float())
+        if pi is not None:
+            # Silence here would read as "conditioning does not generalise" when the
+            # truth is "the conditioning argument was discarded".
+            raise ValueError(
+                "this net is family-conditioned (cond_mode='family') but pi= was "
+                "passed, and it would be ignored. Train with --cond_mode pi.")
+        return self.family_emb(family_idx)
 
     def _condition(self, family_idx: torch.Tensor, force_null: bool = False,
-                   apply_dropout: bool = True) -> torch.Tensor:
-        cond = self.cond_proj(self.family_emb(family_idx))
+                   apply_dropout: bool = True,
+                   pi: Optional[torch.Tensor] = None) -> torch.Tensor:
+        cond = self.cond_proj(self._encode_cond(family_idx, pi))
         null = self.null_cond.unsqueeze(0).expand_as(cond)
         if force_null:
             return null
@@ -305,18 +377,36 @@ class FlowVelocityNet(nn.Module):
         return cond
 
     def forward(self, x: torch.Tensor, t: torch.Tensor,
-                family_idx: torch.Tensor, force_null: bool = False) -> torch.Tensor:
+                family_idx: torch.Tensor, force_null: bool = False,
+                pi: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # `pi` is LAST in every signature it appears in, here and on RectifiedFlow.
+        # Not style: tests/test_flow.py passes t0/t1/n_steps to integrate() and
+        # guidance_scale to forward_cfg() POSITIONALLY, so an earlier slot would
+        # silently rebind nine existing call sites.
         te = self.time_mlp(sinusoidal_time_embedding(t, self.time_embed_dim))
-        cond = self._condition(family_idx, force_null=force_null)
+        if pi is not None and pi.dim() == 2 and pi.shape[0] == 1 \
+                and x.shape[0] != 1:
+            # One mixture, a batch of draws -- the eval-side `fidx.expand(n)` idiom.
+            pi = pi.expand(x.shape[0], -1)
+        cond = self._condition(family_idx, force_null=force_null, pi=pi)
         return self.net(torch.cat([x, te, cond], dim=-1))
 
     def forward_cfg(self, x, t, family_idx,
-                    guidance_scale: float = 1.0) -> torch.Tensor:
-        """v_null + s*(v_cond - v_null). Same algebra as StackVAE.decode_cfg."""
-        out = self.forward(x, t, family_idx)
+                    guidance_scale: float = 1.0,
+                    pi: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        v_null + s*(v_cond - v_null). Same algebra as StackVAE.decode_cfg.
+
+        Unchanged by the conditioning mode: the null branch is `null_cond`, which is
+        reached through force_null and never touches the label. With a continuous
+        pi, s > 1 extrapolates away from the unconditional field in the direction of
+        that mixture -- a "more of this mixture" control the discrete table could not
+        express.
+        """
+        out = self.forward(x, t, family_idx, pi=pi)
         if guidance_scale == 1.0:
             return out
-        null = self.forward(x, t, family_idx, force_null=True)
+        null = self.forward(x, t, family_idx, force_null=True, pi=pi)
         return null + guidance_scale * (out - null)
 
 
@@ -368,7 +458,8 @@ class RectifiedFlow(nn.Module):
     # -------- training --------
 
     def loss(self, x1: torch.Tensor, family_idx: torch.Tensor,
-             generator=None) -> Tuple[torch.Tensor, dict]:
+             generator=None, pi: Optional[torch.Tensor] = None
+             ) -> Tuple[torch.Tensor, dict]:
         b = x1.shape[0]
         dev = x1.device
         x0 = self.sample_source(b, device=dev, generator=generator)
@@ -378,7 +469,7 @@ class RectifiedFlow(nn.Module):
             xt = xt + self.path_noise * torch.randn(
                 x1.shape, device=dev, generator=generator)
         u = x1 - x0
-        pred = self.net(xt, t, family_idx)
+        pred = self.net(xt, t, family_idx, pi=pi)
         loss = torch.mean((pred - u) ** 2)
         return loss, {
             "loss": float(loss.detach()),
@@ -392,7 +483,8 @@ class RectifiedFlow(nn.Module):
     @torch.no_grad()
     def integrate(self, x: torch.Tensor, family_idx: torch.Tensor,
                   t0: float, t1: float, n_steps: int,
-                  guidance_scale: float = 1.0) -> torch.Tensor:
+                  guidance_scale: float = 1.0,
+                  pi: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Explicit Euler from t0 to t1 in n_steps uniform steps.
 
@@ -414,24 +506,27 @@ class RectifiedFlow(nn.Module):
         for i in range(n_steps):
             t = torch.full((cur.shape[0],), t0 + i * dt, device=cur.device)
             cur = cur + dt * self.net.forward_cfg(cur, t, family_idx,
-                                                  guidance_scale=guidance_scale)
+                                                  guidance_scale=guidance_scale,
+                                                  pi=pi)
         return cur
 
     @torch.no_grad()
     def sample(self, n: int, family_idx: torch.Tensor, n_steps: int = 50,
                guidance_scale: float = 1.0, generator=None,
-               x0: Optional[torch.Tensor] = None) -> torch.Tensor:
+               x0: Optional[torch.Tensor] = None,
+               pi: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Draw from the source (or take x0) and integrate 0 -> 1."""
         if x0 is None:
             x0 = self.sample_source(
                 n, device=next(self.net.parameters()).device, generator=generator)
         return self.integrate(x0, family_idx, 0.0, 1.0, n_steps,
-                              guidance_scale=guidance_scale)
+                              guidance_scale=guidance_scale, pi=pi)
 
     @torch.no_grad()
     def round_trip(self, x1: torch.Tensor, family_idx: torch.Tensor,
-                   n_steps: int = 50,
-                   guidance_scale: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+                   n_steps: int = 50, guidance_scale: float = 1.0,
+                   pi: Optional[torch.Tensor] = None
+                   ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         The only sense in which a flow has a round trip.
 
@@ -456,9 +551,9 @@ class RectifiedFlow(nn.Module):
                   f"{guidance_scale} integrates a different field forwards than "
                   f"backwards; the residual is not interpretable as ODE error.")
         x0_hat = self.integrate(x1, family_idx, 1.0, 0.0, n_steps,
-                                guidance_scale=guidance_scale)
+                                guidance_scale=guidance_scale, pi=pi)
         x1_hat = self.integrate(x0_hat, family_idx, 0.0, 1.0, n_steps,
-                                guidance_scale=guidance_scale)
+                                guidance_scale=guidance_scale, pi=pi)
         num = float(torch.linalg.vector_norm(x1_hat - x1))
         den = float(torch.linalg.vector_norm(x1)) + 1e-30
         return x1_hat, x0_hat, {
@@ -496,25 +591,45 @@ class FlowModel:
     def spectrum(self) -> dict:
         return self.meta.get("train", {}).get("spectrum", {}) or {}
 
+    @property
+    def cond(self) -> dict:
+        """
+        The sealed conditioning block. Defaults to family mode, which is what makes
+        every flow sealed before pi-conditioning existed load unchanged.
+        """
+        return self.meta.get("cond", {}) or {"mode": "family"}
+
+    @property
+    def cond_mode(self) -> str:
+        return str(self.cond.get("mode", "family"))
+
     @torch.no_grad()
     def sample_codes(self, family_idx: torch.Tensor, n_steps: Optional[int] = None,
                      guidance_scale: Optional[float] = None,
                      vae_guidance_scale: float = 1.0,
-                     generator=None) -> torch.Tensor:
-        """Generate raw PCA codes, ready for DualGramPCA.inverse_transform."""
+                     generator=None,
+                     pi: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Generate raw PCA codes, ready for DualGramPCA.inverse_transform.
+
+        `pi` is the requested mixture for a pi-conditioned flow, and may be one the
+        zoo never trained on -- that is the zero-shot arm. `family_idx` still selects
+        the basis and the per-family code normalization, so it is required either way.
+        """
         x = self.flow.sample(
             family_idx.shape[0], family_idx,
             n_steps=n_steps or self.default_steps,
             guidance_scale=(self.default_guidance if guidance_scale is None
                             else guidance_scale),
-            generator=generator)
+            generator=generator, pi=pi)
         return self.space.from_flow(x, family_idx,
                                     guidance_scale=vae_guidance_scale)
 
     @torch.no_grad()
     def round_trip_codes(self, codes: torch.Tensor, family_idx: torch.Tensor,
                          n_steps: Optional[int] = None,
-                         vae_guidance_scale: float = 1.0
+                         vae_guidance_scale: float = 1.0,
+                         pi: Optional[torch.Tensor] = None
                          ) -> Tuple[torch.Tensor, dict]:
         """
         Encode real codes into the space, reverse then re-integrate, decode back.
@@ -525,7 +640,7 @@ class FlowModel:
         """
         x1 = self.space.to_flow(codes, family_idx)
         x1_hat, _x0, diag = self.flow.round_trip(
-            x1, family_idx, n_steps=n_steps or self.default_steps)
+            x1, family_idx, n_steps=n_steps or self.default_steps, pi=pi)
         out = self.space.from_flow(x1_hat, family_idx,
                                     guidance_scale=vae_guidance_scale)
         return out, diag
@@ -537,8 +652,23 @@ class FlowModel:
 
 def save_flow(flow: RectifiedFlow, space: FlowSpace, save_dir: str, *,
               provenance: dict, train_meta: Optional[dict] = None,
-              defaults: Optional[dict] = None) -> dict:
-    """Write flow_meta.json + flow_weights.pt. Same shape as vae_meta.json."""
+              defaults: Optional[dict] = None,
+              cond_meta: Optional[dict] = None) -> dict:
+    """
+    Write flow_meta.json + flow_weights.pt. Same shape as vae_meta.json.
+
+    FLOW_LAYOUT_VERSION deliberately does NOT move when pi-conditioning is added.
+    The asymmetry is what we want: new code reading an old meta gets cond_mode's
+    "family" default and behaves identically, while old code reading a new meta dies
+    on an unexpected keyword at FlowVelocityNet(**meta["net"]) -- loud, not silent.
+    Bumping instead would make every already-sealed flow unloadable, including
+    runs/emb3/flow_k*_collapsed/, which CLAUDE.md forbids pruning because it is the
+    only surviving evidence for misstep 21.
+
+    `cond_meta` carries what pi-conditioning has to bind to and the net config
+    cannot express: the DOMAIN ORDER the mixtures were written in, and a fingerprint
+    of the pi matrix. Both are load-time refusals rather than comments.
+    """
     os.makedirs(save_dir, exist_ok=True)
     meta = {
         "layout_version": FLOW_LAYOUT_VERSION,
@@ -549,6 +679,18 @@ def save_flow(flow: RectifiedFlow, space: FlowSpace, save_dir: str, *,
         "flow": flow.config(),
         "space_state": space.state(),
         "defaults": defaults or {"n_steps": 50, "guidance_scale": 1.0},
+        # Derived from the net itself, never from a caller argument, so meta["cond"]
+        # and meta["net"] cannot disagree about which mode was trained.
+        "cond": {
+            "mode": flow.net.cond_mode,
+            "pi_dim": flow.net.pi_dim,
+            # The VAE decoder stays family-conditioned (RESEARCH_PLAN 6.6 makes it an
+            # ablation, not the mechanism), so a latent-space pi flow has a
+            # pi-conditioned velocity field and a pi-blind decoder. Sealed rather
+            # than remembered.
+            "decoder_cond_mode": "family",
+            **(cond_meta or {}),
+        },
         "provenance": provenance,
         "train": train_meta or {},
     }
@@ -612,10 +754,26 @@ def load_flow(save_dir: str, *, code_stats=None, vae=None, device=None,
         raise RuntimeError(f"Refusing to load {save_dir}: unknown space "
                            f"{space_name!r}.")
 
+    # cond_mode defaults to "family" inside FlowVelocityNet, so a meta sealed before
+    # pi-conditioning existed rebuilds byte-identically.
     net = FlowVelocityNet(**meta["net"]).to(dev)
     flow = RectifiedFlow(net, **meta["flow"]).to(dev)
-    flow.load_state_dict(
-        torch.load(os.path.join(save_dir, "flow_weights.pt"), map_location=dev))
+    sd = torch.load(os.path.join(save_dir, "flow_weights.pt"), map_location=dev)
+
+    # Name the mismatch. load_state_dict is strict, so a meta whose cond_mode has
+    # been edited away from its weights already fails -- but it fails with
+    # "Missing key(s) in state_dict: net.pi_mlp.0.weight", which reads as a corrupt
+    # checkpoint rather than as the one-word disagreement it is.
+    has_pi = any(k.startswith("net.pi_mlp.") for k in sd)
+    has_fam = any(k.startswith("net.family_emb.") for k in sd)
+    want_pi = net.cond_mode == "pi"
+    if want_pi != has_pi or want_pi == has_fam:
+        raise RuntimeError(
+            f"Refusing to load {save_dir}: flow_meta.json says "
+            f"cond_mode={net.cond_mode!r} but flow_weights.pt holds "
+            f"{'pi_mlp' if has_pi else 'family_emb'} weights. The metadata and the "
+            f"checkpoint disagree about how this flow was conditioned.")
+    flow.load_state_dict(sd)
     flow.eval()
 
     if int(space.dim) != int(meta["dim"]):

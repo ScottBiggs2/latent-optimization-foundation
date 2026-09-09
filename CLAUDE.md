@@ -43,6 +43,44 @@ scores ΔPPL ≈ 0 — *better* than an honest sample — while generating nothi
 `gauss_codes` is the null for this question and **cannot detect it**, because a
 collapsed flow beats it by construction.
 
+**`eval_stack.py` could not see a zoo at all until 2026-09-09, and its ΔPPL baseline
+was a RANDOM MODEL.** Two separate defects, both found by running it:
+`evaluate_arch` called `load_model(arch)`, which `registry.py` refuses for every
+`from_scratch: True` arch, and then read `cfg["default_model_id"]`, which the zoo
+configs deliberately omit. Fixed with `build_zoo_model(arch, seed=0)` and the `"gpt2"`
+tokenizer (the zoo vocab *is* GPT-2 BPE at 50257). Worse, the target write-back was
+skipped at `sample_idx == 0` — correct for a noise ensemble, where row 0 *is* w_0 and
+the live model already holds it, and silently catastrophic for a zoo, where the live
+model is a random init and row 0 is an arbitrary member. Measured before the fix:
+`original_ppl` 57419.25, `pca_only` 175.58, **Δ = −99.694%**. After: Δ = −0.000% with
+`cos=1.000000`, `relL2=2.2e-07`. **A large negative ΔPPL on a zoo means the baseline
+is wrong, not that the arm is good.**
+
+**Under π-conditioning `code_rms_ratio` inverts, and a CORRECT flow prints
+`[COLLAPSED]`.** (2026-09-09) The pooled ratio compares sample spread to the spread of
+the whole training set. With constant conditioning those are one population and 1.0 is
+right. Condition on π and they are not: samples at a fixed π carry the *conditional*
+spread while the target carries the *pooled* one. Measured `pooled/within = 3.07` at
+Mini, so a perfectly conditional flow reads **0.33 pooled** — the same number misstep
+19 recorded for genuine collapse. `train_flow.py` now emits both, with
+`code_rms_reference` sealed beside them: `code_rms_ratio` samples at the *training*
+π's (so ~1.0 stays correct in either mode) and `code_rms_ratio_at_fixed_pi` compares
+one anchor's samples to that anchor's own within-group spread. Only the second can see
+memorisation-as-point-mass, which is π-conditioning's own failure mode — π is nearly a
+unique key here, 85 distinct mixtures over 100 members with each singleton seen once.
+
+**Measured at Mini, all 8 π cells: conditioning is INERT at k=N−1.** With
+`C = (R−at_pi)/(R−1)`, R = 3.07 (π ignored) and 1.0 (fully conditional): C = −0.03…+0.02
+at k=99/91, and +0.12…+0.20 at k=50/46. The pooled ratio reads a healthy 0.85–1.10 in
+**every** cell, so this is invisible without the conditional statistic. Halving k is
+worth ~10× on conditioning strength.
+
+**Verify the π↔code row pairing, or a scrambled join reads as a null result.**
+`train_flow.py` seals `pi_code_distance_corr` — the correlation of pairwise L1 in
+mixture space against pairwise L2 in code space. Measured +0.63…+0.69; a shuffled
+pairing gives ~0. It is a *pairing* check, independent of whether the flow learned
+anything, and it fails in one epoch rather than after 500.
+
 **Gate on `ev0/median` and `effective_rank_ratio`, never `ev[0]/ev[k−1]`.**
 (misstep 15b) The tail ratio reads 12.09 at k=N−1 and 1.006 at k=N/2 on the *same*
 pure-noise data, because at the rank bound `ev[k−1]` is the smallest direction

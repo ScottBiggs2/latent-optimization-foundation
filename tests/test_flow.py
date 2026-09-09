@@ -85,10 +85,11 @@ class ConstantField(nn.Module):
         # RectifiedFlow.sample reads next(self.net.parameters()).device.
         self.dummy = nn.Parameter(torch.zeros(1, dtype=dtype))
 
-    def forward(self, x, t, family_idx, force_null: bool = False):
+    def forward(self, x, t, family_idx, force_null: bool = False, pi=None):
         return self.c.unsqueeze(0).expand(x.shape[0], self.dim)
 
-    def forward_cfg(self, x, t, family_idx, guidance_scale: float = 1.0):
+    def forward_cfg(self, x, t, family_idx, guidance_scale: float = 1.0,
+                    pi=None):
         return self.forward(x, t, family_idx)
 
     def config(self) -> dict:
@@ -104,11 +105,12 @@ class SpyNet(nn.Module):
         self.lin = nn.Linear(dim, dim)
         self.seen: List[tuple] = []
 
-    def forward(self, x, t, family_idx, force_null: bool = False):
+    def forward(self, x, t, family_idx, force_null: bool = False, pi=None):
         self.seen.append((x.detach().clone(), t.detach().clone()))
         return self.lin(x)
 
-    def forward_cfg(self, x, t, family_idx, guidance_scale: float = 1.0):
+    def forward_cfg(self, x, t, family_idx, guidance_scale: float = 1.0,
+                    pi=None):
         return self.forward(x, t, family_idx)
 
 
@@ -702,6 +704,146 @@ def test_save_load_latent() -> None:
         shutil.rmtree(tmp)
 
 
+def test_pi_conditioning() -> None:
+    """cond_mode='pi': the encoder swaps, everything after it must not."""
+    print("\n--- pi conditioning (RESEARCH_PLAN 6.2) ---")
+    torch.manual_seed(0)
+    dim, P, B = 9, 5, 6
+
+    fam = FlowVelocityNet(dim=dim, cond_dim=8, hidden_dims=(16, 16))
+    net = FlowVelocityNet(dim=dim, cond_dim=8, hidden_dims=(16, 16),
+                          cond_mode="pi", pi_dim=P)
+
+    keys = set(net.state_dict())
+    check("pi mode builds pi_mlp and NOT family_emb",
+          any(k.startswith("pi_mlp.") for k in keys)
+          and not any(k.startswith("family_emb.") for k in keys))
+    check("family mode builds family_emb and NOT pi_mlp",
+          any(k.startswith("family_emb.") for k in set(fam.state_dict()))
+          and not any(k.startswith("pi_mlp.") for k in set(fam.state_dict())))
+    check("cond_mode defaults to family", fam.cond_mode == "family")
+    check("an unknown cond_mode is refused",
+          _raises(lambda: FlowVelocityNet(dim=dim, cond_mode="mixture"),
+                  "unknown cond_mode"))
+
+    # THE backward-compatibility pin. A flow_meta.json sealed before pi-conditioning
+    # existed has no cond_mode/pi_dim keys, and must still rebuild byte-identically.
+    old = {k: v for k, v in fam.config().items()
+           if k not in ("cond_mode", "pi_dim")}
+    check("a pre-pi net config still rebuilds a family net",
+          set(FlowVelocityNet(**old).state_dict()) == set(fam.state_dict()))
+    check("config round-trips in pi mode",
+          set(FlowVelocityNet(**net.config()).state_dict()) == keys)
+
+    x = torch.randn(B, dim)
+    t = torch.rand(B)
+    f0 = torch.zeros(B, dtype=torch.long)
+    f1 = torch.full((B,), 3, dtype=torch.long)
+    pa = torch.tensor([[1.0, 0, 0, 0, 0]]).expand(B, P).contiguous()
+    pb = torch.tensor([[0.0, 0, 1.0, 0, 0]]).expand(B, P).contiguous()
+
+    net.eval()
+    with torch.no_grad():
+        va, vb = net(x, t, f0, pi=pa), net(x, t, f0, pi=pb)
+        # If this ever passes, pi is being ignored and every downstream slope is
+        # measuring nothing.
+        check("two different pi give different velocities",
+              not torch.allclose(va, vb))
+        check("family_idx is ignored in pi mode",
+              torch.equal(va, net(x, t, f1, pi=pa)))
+        # Nearby mixtures give nearby fields -- a sanity check on the encoder, NOT a
+        # smoothness claim: 6.2 says "of course it interpolates" is a one-line review.
+        near = pa + 1e-4 * (pb - pa)
+        check("a nearby pi gives a nearby velocity",
+              float((net(x, t, f0, pi=near) - va).norm())
+              < float((vb - va).norm()) * 1e-2)
+
+        # CFG algebra must be untouched by the encoder swap.
+        s = 2.5
+        null = net(x, t, f0, force_null=True, pi=pa)
+        check("forward_cfg = null + s*(cond - null) in pi mode",
+              torch.allclose(net.forward_cfg(x, t, f0, s, pi=pa),
+                             null + s * (va - null), atol=1e-6))
+        check("the null branch does not depend on pi",
+              torch.equal(null, net(x, t, f0, force_null=True, pi=pb)))
+        check("guidance_scale=1.0 is the plain conditional",
+              torch.equal(net.forward_cfg(x, t, f0, 1.0, pi=pa), va))
+
+        # (1, P) broadcasts, matching eval_stack's fidx.expand(n) idiom.
+        check("a single pi row broadcasts across the batch",
+              torch.allclose(net(x, t, f0, pi=pa[:1]), va, atol=1e-6))
+
+    # Refusals: a dropped or ignored pi must never be silent.
+    check("pi mode refuses a missing pi",
+          _raises(lambda: net(x, t, f0), "no pi= was passed"))
+    check("family mode refuses a pi it would ignore",
+          _raises(lambda: fam(x, t, f0, pi=pa), "would be ignored"))
+    check("pi mode refuses the wrong pi width",
+          _raises(lambda: net(x, t, f0, pi=torch.randn(B, P + 1)),
+                  "was built for pi_dim"))
+
+    # pi has to survive the whole RectifiedFlow call chain, not just the net.
+    flow = RectifiedFlow(net)
+    with torch.no_grad():
+        g = torch.Generator().manual_seed(7)
+        sa = flow.sample(B, f0, n_steps=4, generator=g, pi=pa)
+        g = torch.Generator().manual_seed(7)
+        sb = flow.sample(B, f0, n_steps=4, generator=g, pi=pb)
+        check("sample() carries pi through integrate()",
+              not torch.allclose(sa, sb))
+        loss_a, _ = flow.loss(torch.randn(B, dim), f0,
+                              generator=torch.Generator().manual_seed(1), pi=pa)
+        check("loss() accepts pi", torch.isfinite(loss_a))
+        _, _, d = flow.round_trip(torch.randn(B, dim), f0, n_steps=4, pi=pa)
+        check("round_trip() accepts pi", "rel_l2_space" in d)
+
+
+def test_save_load_pi() -> None:
+    """A sealed pi flow reloads, and a meta edited away from its weights is refused."""
+    print("\n--- pi flow persistence ---")
+    torch.manual_seed(0)
+    k, P = 9, 5
+    cs = _code_stats(k=k)
+    tmp = tempfile.mkdtemp()
+    try:
+        d = os.path.join(tmp, "flow_k9_codes_pi")
+        space = build_space("codes", code_stats=cs)
+        net = FlowVelocityNet(dim=k, cond_dim=8, hidden_dims=(16, 16),
+                              cond_mode="pi", pi_dim=P)
+        flow = RectifiedFlow(net)
+        save_flow(flow, space, d, provenance={"trust": "verified"},
+                  cond_meta={"domains": ["web", "code", "math", "books",
+                                         "multilingual"],
+                             "pi_fingerprint": "abc123"})
+        meta = json.load(open(os.path.join(d, "flow_meta.json")))
+        check("cond block is sealed",
+              meta["cond"]["mode"] == "pi" and meta["cond"]["pi_dim"] == P
+              and meta["cond"]["pi_fingerprint"] == "abc123")
+        check("the decoder's conditioning mode is sealed too",
+              meta["cond"]["decoder_cond_mode"] == "family")
+        check("FLOW_LAYOUT_VERSION did NOT move for pi conditioning",
+              meta["layout_version"] == FLOW_LAYOUT_VERSION == 1)
+
+        fm = load_flow(d, code_stats=cs, device="cpu")
+        check("a reloaded pi flow reports cond_mode='pi'", fm.cond_mode == "pi")
+        pi = torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.2]]).expand(4, P).contiguous()
+        fx = torch.zeros(4, dtype=torch.long)
+        a = fm.sample_codes(fx, generator=torch.Generator().manual_seed(3), pi=pi)
+        b = fm.sample_codes(fx, generator=torch.Generator().manual_seed(3), pi=pi)
+        check("seeded samples are bit-identical after a reload", torch.equal(a, b))
+
+        # A meta hand-edited to disagree with its weights must name the
+        # disagreement, not surface a raw "Missing key(s) in state_dict".
+        meta["net"]["cond_mode"] = "family"
+        with open(os.path.join(d, "flow_meta.json"), "w") as f:
+            json.dump(meta, f)
+        check("a cond_mode/weights mismatch is refused by name",
+              _raises(lambda: load_flow(d, code_stats=cs, device="cpu"),
+                      "disagree about how this flow was conditioned"))
+    finally:
+        shutil.rmtree(tmp)
+
+
 def main() -> int:
     torch.manual_seed(0)
     test_time_embedding()
@@ -714,6 +856,8 @@ def main() -> int:
     test_latent_space()
     test_save_load_codes()
     test_save_load_latent()
+    test_pi_conditioning()
+    test_save_load_pi()
 
     print("\n" + "=" * 64)
     if FAILS:

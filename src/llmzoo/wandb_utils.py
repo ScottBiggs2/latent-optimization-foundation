@@ -23,7 +23,15 @@ try:
 except ImportError:
     _wandb = None
 
-PROJECT = "llm-vae"
+# The historical project. Everything landed here until 2026-09-09, so it stays the
+# default and no existing run moves.
+DEFAULT_PROJECT = "llm-vae"
+
+# `project` is PASSED to wandb.init() below, and an explicit argument beats wandb's own
+# WANDB_PROJECT env handling — so the env var has to be read here or it silently does
+# nothing. Precedence: the caller's project= argument, then $WANDB_PROJECT, then the
+# historical default.
+PROJECT = os.environ.get("WANDB_PROJECT", DEFAULT_PROJECT)
 
 # wandb.init() silently falls back to the account's server-side "default
 # team" when entity isn't passed explicitly — for this account that's a
@@ -31,6 +39,28 @@ PROJECT = "llm-vae"
 # Pin it so that ambiguity can't bite again. Override with WANDB_ENTITY if
 # this ever needs to change.
 ENTITY = os.environ.get("WANDB_ENTITY", "scottbiggs2001-northeastern-university")
+
+
+def resolve_project(project: Optional[str] = None) -> str:
+    """The one place the precedence rule lives, so no caller can reimplement it."""
+    return project or os.environ.get("WANDB_PROJECT") or DEFAULT_PROJECT
+
+
+def add_wandb_args(p) -> None:
+    """
+    The two routing flags, defined once so every entry point spells them the same.
+
+    Both default to None, which means "keep the historical behaviour": the project
+    falls back to $WANDB_PROJECT then "llm-vae", and the group falls back to whatever
+    the call site already passed (usually the Slurm job id).
+    """
+    p.add_argument("--wandb_project", default=None,
+                   help="W&B project. Default: $WANDB_PROJECT, then 'llm-vae'. "
+                        "Split by workstream, e.g. llmzoo-zoo / llmzoo-genverify.")
+    p.add_argument("--wandb_group", default=None,
+                   help="W&B run group. Default: the Slurm job id. Pass the "
+                        "EXPERIMENT CELL when one experiment spans several jobs, "
+                        "e.g. b015_k99 or zoo_gpt2_zoo_mini_b015_n100.")
 
 
 def init_run(
@@ -41,6 +71,7 @@ def init_run(
     artifact_dir: Optional[str] = None,
     name_suffix: Optional[str] = None,
     group: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> bool:
     """
     Start a W&B run. No-ops (returns False) if wandb is missing, disabled,
@@ -60,6 +91,17 @@ def init_run(
         W&B run group, so every run from one pipeline invocation collapses into
         a single expandable row. Defaults to the Slurm job id, which is exactly
         the right granularity: one sbatch, one group.
+
+        Pass an EXPERIMENT CELL instead when one logical experiment spans several
+        sbatch jobs -- `zoo_<arch>_<tag>_n<N>` for a zoo, `b015_k99` for a
+        generative-verification cell. The job-id default cannot express that, which
+        is why the spectrum stage historically escaped its zoo's group.
+
+    project
+        W&B project. Defaults to $WANDB_PROJECT, then the historical "llm-vae".
+        Split by workstream rather than by run: one project per phase keeps the runs
+        table scannable, where a single project mixes zoo training, spectra and
+        generative evaluation into one undifferentiated list.
     """
     if not enabled:
         return False
@@ -80,7 +122,7 @@ def init_run(
         name = f"{name}_{name_suffix}"
     _wandb.init(
         entity=ENTITY,
-        project=PROJECT,
+        project=resolve_project(project),
         name=name,
         job_type=job_type,
         group=group or f"job_{job_id}",

@@ -165,6 +165,7 @@ def main() -> int:
                         "$ARTIFACT_DIR, deliberately NOT zoo_dir, so every beta "
                         "of the calibration is scored on identical text.")
     p.add_argument("--no_wandb", action="store_true")
+    wb.add_wandb_args(p)
     args = p.parse_args()
 
     from transformers import AutoTokenizer
@@ -187,7 +188,9 @@ def main() -> int:
                 # otherwise the gate lands in a different W&B row from the
                 # branches it scored. n_members comes from zoo_meta rather than a
                 # flag, so the two cannot drift.
-                group=f"zoo_{args.arch}_{tag}_n{int(zmeta['n_members'])}")
+                group=(args.wandb_group
+                       or f"zoo_{args.arch}_{tag}_n{int(zmeta['n_members'])}"),
+                project=args.wandb_project)
 
     # Cache in the ARTIFACT_DIR root, NOT under zoo_dir: the whole point is that
     # every beta of the calibration scores on the same bytes, and each beta has

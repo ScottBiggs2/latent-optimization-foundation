@@ -48,7 +48,9 @@ import numpy as np
 import torch
 
 from llmzoo.artifacts.io import read_json
-from llmzoo.models.registry import get_arch_config, load_model, build_tiny_model
+from llmzoo.models.registry import (
+    get_arch_config, load_model, build_tiny_model, build_zoo_model,
+)
 from llmzoo.models.weight_extractor import (
     read_stack_from_model, write_stack_to_model,
 )
@@ -248,8 +250,20 @@ def evaluate_arch(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = get_arch_config(arch)
 
-    model = (build_tiny_model(arch) if mode == "tiny"
-             else load_model(arch, cache_dir=hf_cache)).to(device)
+    # A zoo architecture is trained from scratch, so there is nothing on the hub to
+    # download: load_model() refuses it by design (registry.py) and the config carries
+    # no `default_model_id`. build_zoo_model() is the constructor train_zoo.py and
+    # eval_domains.py both use, and seed=0 matches eval_domains.py -- the weights are
+    # overwritten by write_stack_to_model before anything is measured, so the seed only
+    # has to be consistent, not meaningful.
+    from_scratch = bool(cfg.get("from_scratch"))
+    if mode == "tiny":
+        model = build_tiny_model(arch)
+    elif from_scratch:
+        model = build_zoo_model(arch, seed=0)
+    else:
+        model = load_model(arch, cache_dir=hf_cache)
+    model = model.to(device)
     model.eval()
 
     tok = None
@@ -266,7 +280,12 @@ def evaluate_arch(
     else:
         from llmzoo.data.val_loader import get_wikitext2_loader
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(cfg["default_model_id"],
+        # A zoo arch has no default_model_id. Its vocab IS GPT-2 BPE at 50257
+        # (RESEARCH_PLAN section 4.5, fixed across the whole ladder), so "gpt2" is the
+        # correct tokenizer rather than a stand-in -- same id as eval_domains.py's
+        # TOKENIZER_ID, which is what keeps the two scoring paths comparable.
+        tok_id = "gpt2" if from_scratch else cfg["default_model_id"]
+        tok = AutoTokenizer.from_pretrained(tok_id,
                                             cache_dir=hf_cache,
                                             trust_remote_code=True)
         loader = get_wikitext2_loader(tok, seq_len=seq_len,
@@ -275,14 +294,22 @@ def evaluate_arch(
     st = ds.stacks[arch]
     fidx = torch.tensor([st.family_idx], dtype=torch.long, device=device)
 
-    # The target is ensemble member `sample_idx`. Member 0 is the real pretrained
-    # model; any other member is w_0 plus augmentation noise, so it has to be
-    # materialised and written into the model FIRST, or "original PPL" would be the
-    # real model's while the reconstruction target is a different point.
+    # The target is ensemble ROW `sample_idx`, and it is written into the model
+    # UNCONDITIONALLY.
+    #
+    # This used to skip the write at sample_idx == 0, which was correct for exactly
+    # one case and silently catastrophic for the other. For a NOISE ensemble row 0
+    # is w_0, the live pretrained model already holds it, and the write is a no-op.
+    # For a ZOO there is no w_0: the live model is build_zoo_model()'s RANDOM INIT
+    # and row 0 is an arbitrary member (ensemble.py's _extract_zoo says so). Skipping
+    # the write left `original_ppl` measuring a random model -- 57,419 against a
+    # trained member's ~40 -- so every arm's ppl_delta was scored against the most
+    # flattering baseline available and would have read as a spectacular success.
+    #
+    # One redundant write on the noise path is worth strictly more than that.
     target = (np.asarray(ds.w0(arch)) if sample_idx == 0
               else ds.materialize_sample(arch, sample_idx, device=device))
-    if sample_idx != 0:
-        write_stack_to_model(target, model, arch, st)
+    write_stack_to_model(target, model, arch, st)
 
     # Pristine copy AFTER installing the target, so restore() returns to the target.
     # This must be the WHOLE stack, not a list of block flats: with the extra
@@ -620,6 +647,7 @@ def main() -> None:
                         "the benchmark job. report_stack.py picks up any suffix.")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--no_wandb", action="store_true")
+    wb.add_wandb_args(p)
     args = p.parse_args()
 
     # Bare --bench means all three; --bench mmlu means just MMLU; no flag means off.
@@ -670,7 +698,8 @@ def main() -> None:
                         "bench_list": bench_list},
                 tags=["stack", args.run_name] + arch_list,
                 enabled=not args.no_wandb, artifact_dir=args.artifact_dir,
-                name_suffix=f"{args.run_name}_s{args.sample_idx}")
+                name_suffix=f"{args.run_name}_s{args.sample_idx}",
+                project=args.wandb_project, group=args.wandb_group)
 
     print("=" * 74)
     print("Whole-stack evaluation")

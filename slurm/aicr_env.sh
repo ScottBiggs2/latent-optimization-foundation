@@ -87,6 +87,11 @@ else
   export WANDB_MODE="${WANDB_MODE:-offline}"   # then: wandb sync "$WANDB_DIR/<run>"
 fi
 export WANDB_DIR="${WANDB_DIR:-$S/wandb}"
+# One project per workstream, set by the sbatch that owns the workstream. The
+# default keeps every historical run where it is. llmzoo.wandb_utils reads this
+# explicitly, because it PASSES project= to wandb.init() and an explicit argument
+# beats wandb's own handling of the env var.
+export WANDB_PROJECT="${WANDB_PROJECT:-llm-vae}"
 # Say it out loud. An offline fallback is fine; an offline fallback nobody
 # noticed is how 39 training runs end up with no visibility.
 if [ "$WANDB_MODE" = "offline" ]; then
@@ -105,6 +110,7 @@ python -c "import llmzoo" 2>/dev/null || {
 echo "--- env ---"
 echo "host=$(hostname)  job=${SLURM_JOB_ID:-local}  part=${SLURM_JOB_PARTITION:-local}"
 echo "cpus=${SLURM_CPUS_PER_TASK:-?}  mem=${SLURM_MEM_PER_NODE:-?}M  gpus=${SLURM_GPUS_ON_NODE:-0}"
-echo "code=$CODE_DIR  artifacts=$ARTIFACT_DIR  scratch=$S  wandb=$WANDB_MODE"
+echo "code=$CODE_DIR  artifacts=$ARTIFACT_DIR  scratch=$S"
+echo "wandb=$WANDB_MODE  project=$WANDB_PROJECT"
 python -c "import torch;print('torch',torch.__version__,'cuda',torch.version.cuda,'gpus',torch.cuda.device_count(),[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])" 2>&1
 echo "-----------"

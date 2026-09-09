@@ -22,7 +22,7 @@ import argparse
 import json
 import os
 import time
-from typing import Dict
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -45,9 +45,59 @@ def ts() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stages
+# Member selection
 # ---------------------------------------------------------------------------
 
+def resolve_members(args) -> Optional[List[int]]:
+    """
+    --members -> an explicit sorted member list, or None for "the whole zoo".
+
+    'train' reads the split that train_zoo.py already sealed rather than taking a
+    list on the command line. The holdout is a property OF THE ZOO -- it was chosen
+    when the plan was built (mixtures.holdout_split) and written into
+    zoo_meta.json -- so retyping it into an sbatch is one transcription away from a
+    basis that quietly contains the members it is supposed to exclude.
+    """
+    spec = str(getattr(args, "members", "all")).strip()
+    if spec in ("", "all"):
+        return None
+    if args.source != "zoo":
+        raise SystemExit(f"--members {spec!r} needs --source zoo.")
+    if args.zoo_dir is None:
+        raise SystemExit(f"--members {spec!r} needs --zoo_dir.")
+
+    if spec == "train":
+        if len(args.arch_list) != 1:
+            raise SystemExit(
+                "--members train reads one zoo_meta.json, so it needs exactly one "
+                f"--arch_list entry; got {args.arch_list}.")
+        zpath = os.path.join(args.zoo_dir, args.arch_list[0], "zoo_meta.json")
+        z = read_json(zpath)
+        if z is None:
+            raise SystemExit(f"--members train: no zoo_meta.json at {zpath}.")
+        holdout = z.get("holdout") or {}
+        idxs = holdout.get("train")
+        if not idxs:
+            raise SystemExit(
+                f"{zpath} has no holdout['train']. It predates the sealed split; "
+                f"re-run scripts/train_zoo.py --mode plan for this zoo.")
+        held = sorted(set(holdout.get("interior", []))
+                      | set(holdout.get("vertex", [])))
+        print(f"  holdout   : interior={holdout.get('interior')} "
+              f"vertex={holdout.get('vertex')} -> {len(held)} members excluded")
+        return sorted(int(i) for i in idxs)
+
+    try:
+        return sorted({int(t) for t in spec.replace(",", " ").split()})
+    except ValueError:
+        raise SystemExit(
+            f"--members {spec!r}: expected 'all', 'train', or a comma-separated "
+            f"list of integers.")
+
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
 
 
 def stage_pca(args, ds: EnsembleDataset, pca_root: str) -> Dict[str, DualGramPCA]:
@@ -334,6 +384,19 @@ def main() -> None:
                         "<zoo_dir>/<arch>/w_<i>.npy. train_zoo.py's own "
                         "--zoo_dir is the arch-level dir, one level down.")
 
+    p.add_argument("--members", default="all",
+                   help="Which zoo members the basis is fit on. 'all' (default) "
+                        "uses 0..n_samples-1. 'train' reads "
+                        "<zoo_dir>/<arch>/zoo_meta.json['holdout']['train'], so "
+                        "the sealed interior + vertex holdout is genuinely "
+                        "OUTSIDE the span rather than merely outside the flow's "
+                        "training rows -- which is what 'held out' has to mean "
+                        "before a generative number can be quoted against a "
+                        "retrieval baseline (RESEARCH_PLAN §6.4). Or pass a "
+                        "comma-separated index list. N and k follow the subset, "
+                        "so --members train on a 100-member zoo gives N=92 and a "
+                        "rank bound of 91.")
+
     # Rank
     p.add_argument("--k", type=int, default=None,
                    help="Code dimension. Default N-1 (the rank bound).")
@@ -355,11 +418,19 @@ def main() -> None:
     p.add_argument("--force_extract", action="store_true")
     p.add_argument("--force_pca", action="store_true")
     p.add_argument("--no_wandb", action="store_true")
+    wb.add_wandb_args(p)
     args = p.parse_args()
 
     run_root = os.path.join(args.artifact_dir, "runs", args.run_name)
     pca_root = os.path.join(run_root, "pca")
     os.makedirs(run_root, exist_ok=True)
+
+    member_idxs = resolve_members(args)
+    if member_idxs is not None:
+        # N follows the subset. Resolved BEFORE k's default so --members train
+        # gives k = 91 rather than 99 -- the rank bound of the ensemble that is
+        # actually fit, not of the zoo it was drawn from.
+        args.n_samples = len(member_idxs)
 
     k = args.k if args.k is not None else args.n_samples - 1
     vae_dir = os.path.join(run_root, f"vae_k{k}")
@@ -367,13 +438,21 @@ def main() -> None:
     # name_suffix matters: slurm/stack_run.sbatch calls this script once per rank in a
     # single job, and each call is its own process, so without it both runs land
     # under the identical name train_stack_<jobid>.
+    # --wandb_group matters here specifically. train_zoo.py collects a zoo's trunk,
+    # branches and gate under `zoo_<arch>_<tag>_n<N>`, and its docstring claims the
+    # spectrum stage joins them -- but this script passed no group, so every spectrum
+    # run fell back to `job_<jobid>` and sat outside the row it belonged to.
     wb.init_run(job_type="train_stack", config=vars(args),
                 tags=[args.mode, f"k{k}", args.run_name] + args.arch_list,
                 enabled=not args.no_wandb, artifact_dir=args.artifact_dir,
-                name_suffix=f"{args.run_name}_k{k}")
+                name_suffix=f"{args.run_name}_k{k}",
+                project=args.wandb_project, group=args.wandb_group)
 
     print("=" * 68)
     print("Whole-stack pipeline (per-family Gram PCA + StackVAE)")
+    if member_idxs is not None:
+        print(f"  members   : {args.members} -> N={len(member_idxs)} "
+              f"{member_idxs[:6]}{' …' if len(member_idxs) > 6 else ''}")
     print(f"  run       : {args.run_name}   -> {run_root}")
     print(f"  archs     : {args.arch_list}")
     print(f"  N         : {args.n_samples}   noise_scale={args.noise_scale}")
@@ -391,7 +470,8 @@ def main() -> None:
                          mode=args.mode, artifact_dir=run_root, seed=args.seed,
                          chunk_budget_bytes=args.chunk_budget_mb * 1024 * 1024,
                          force_extract=args.force_extract,
-                         source=args.source, zoo_dir=args.zoo_dir)
+                         source=args.source, zoo_dir=args.zoo_dir,
+                         member_idxs=member_idxs)
     print(ds.summary())
 
     print(f"\n{ts()} Stage 2: per-family Gram PCA")

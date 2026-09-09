@@ -241,6 +241,146 @@ class CodeStats:
 
 
 # ---------------------------------------------------------------------------
+# The mixture matrix
+#
+# pi is the conditioning variable for RESEARCH_PLAN 6.2 and it lives in the ZOO,
+# not in the run: <zoo_dir>/<arch>/zoo_meta.json["members"][i]["pi"].
+#
+# It is deliberately NOT copied into codes_k<k>/. That would look tidier and buy
+# nothing real -- codes_k<k>/ is already not self-contained, because load_run
+# rebuilds the EnsembleDataset from ens_meta["zoo_dir"] anyway -- while costing a
+# re-run of train_stack.py over every already-sealed PCA, and a CODE_STATS_VERSION
+# bump would make require_version refuse every codes dir on /work until each one
+# was regenerated.
+#
+# The join is row -> member -> pi. Row j is member ens_meta["member_idxs"][j], or
+# member j when the run used the whole zoo. Getting that mapping wrong is the
+# failure this module exists to make impossible: a scrambled pairing trains the flow
+# on shuffled conditioning and produces a FLAT slope, which is indistinguishable
+# after the fact from "conditioning does not generalise".
+# ---------------------------------------------------------------------------
+
+def validate_pi(pi: np.ndarray, n_domains: int, *,
+                allow_offsimplex: bool = False, tol: float = 1e-4,
+                where: str = "pi") -> np.ndarray:
+    """
+    Shape- and simplex-check a (…, P) mixture array.
+
+    `allow_offsimplex` exists because deliberate extrapolation past a vertex is a
+    legitimate experiment, and the check should be the caller's to waive rather than
+    something the net silently tolerates.
+    """
+    pi = np.asarray(pi, dtype=np.float64)
+    if pi.ndim == 1:
+        pi = pi.reshape(1, -1)
+    if pi.ndim != 2 or pi.shape[1] != n_domains:
+        raise ValueError(f"{where}: expected (M, {n_domains}), got {pi.shape}")
+    if not allow_offsimplex:
+        if pi.min() < -tol:
+            raise ValueError(f"{where}: negative weight {pi.min():.6g}")
+        sums = pi.sum(axis=1)
+        bad = np.abs(sums - 1.0) > tol
+        if bad.any():
+            j = int(np.argmax(bad))
+            raise ValueError(
+                f"{where}: row {j} sums to {sums[j]:.6g}, not 1. Pass "
+                f"allow_offsimplex=True if leaving the simplex is intended.")
+    return pi.astype(np.float32)
+
+
+def build_pi_matrix(arch_list, zoo_metas: Dict[str, dict],
+                    members_by_arch: Dict[str, List[int]]):
+    """
+    Stack per-member pi into the SAME row order stage_codes uses.
+
+    train_stack.stage_codes concatenates architectures in `ds.arch_list` order and,
+    within an architecture, in ensemble row order -- so this walks the same two loops.
+    Returns (pi (M, P) float32, domains, arch_offsets).
+    """
+    domains = None
+    blocks, offsets, total = [], {}, 0
+    for arch in arch_list:
+        z = zoo_metas.get(arch)
+        if z is None:
+            raise ValueError(f"no zoo_meta for {arch}")
+        d = list(z.get("domains") or [])
+        if not d:
+            raise ValueError(f"{arch}: zoo_meta.json has no 'domains'.")
+        if domains is None:
+            domains = d
+        elif d != domains:
+            # DOMAINS order fixes which simplex coordinate means what
+            # (mixtures.py says so in its own header). Two archs disagreeing would
+            # silently transpose the conditioning axis for one of them.
+            raise ValueError(
+                f"{arch}: domains {d} != {domains}. The mixture axis would mean "
+                f"different things in different rows.")
+        members = list(z["members"])
+        by_idx = {int(m["idx"]): m for m in members}
+        rows = []
+        for i in members_by_arch[arch]:
+            m = by_idx.get(int(i))
+            if m is None:
+                raise ValueError(f"{arch}: zoo_meta has no member idx={i}.")
+            if "pi" not in m:
+                raise ValueError(f"{arch}: member {i} has no 'pi'.")
+            rows.append([float(x) for x in m["pi"]])
+        offsets[arch] = total
+        total += len(rows)
+        blocks.append(np.asarray(rows, dtype=np.float32))
+    if domains is None:
+        raise ValueError("build_pi_matrix: empty arch_list")
+    pi = np.concatenate(blocks, axis=0) if blocks else np.zeros((0, 0), np.float32)
+    return validate_pi(pi, len(domains), where="zoo_meta pi"), domains, offsets
+
+
+def load_pi_matrix(ens_meta: dict) -> dict:
+    """
+    Read the pi matrix for a run, from the zoo the run's ensemble points at.
+
+    Returns {"pi", "domains", "arch_offsets", "fingerprint", "zoo_dir"}.
+    """
+    if ens_meta.get("source") != "zoo":
+        raise RuntimeError(
+            f"pi conditioning needs a zoo ensemble; this run's source is "
+            f"{ens_meta.get('source', 'noise')!r}. A manufactured ensemble has no "
+            f"mixtures to condition on.")
+    zoo_dir = ens_meta.get("zoo_dir")
+    if not zoo_dir:
+        raise RuntimeError("ensemble_meta.json has source='zoo' but no zoo_dir.")
+
+    archs = list(ens_meta["arch_list"])
+    n = int(ens_meta["n_samples"])
+    sel = ens_meta.get("member_idxs")
+    rows = list(range(n)) if sel is None else [int(i) for i in sel]
+
+    zoo_metas = {}
+    for arch in archs:
+        p = os.path.join(zoo_dir, arch, "zoo_meta.json")
+        z = read_json(p)
+        if z is None:
+            raise RuntimeError(f"pi conditioning needs {p}, which is missing.")
+        zoo_metas[arch] = z
+    pi, domains, offsets = build_pi_matrix(
+        archs, zoo_metas, {a: rows for a in archs})
+
+    return {
+        "pi": pi,
+        "domains": domains,
+        "arch_offsets": offsets,
+        "zoo_dir": zoo_dir,
+        # Same 6-decimal rounding as CodeStats.fingerprint, for the same reason:
+        # a hash that flips on float noise is one nobody keeps green.
+        "fingerprint": fingerprint({
+            "layout": 1,
+            "domains": list(domains),
+            "n_rows": int(pi.shape[0]),
+            "pi": np.round(pi.astype(np.float64), 6).tolist(),
+        }),
+    }
+
+
+# ---------------------------------------------------------------------------
 # The bundle
 # ---------------------------------------------------------------------------
 
@@ -378,6 +518,11 @@ def load_run(
             # run at all. Read from the recorded meta like everything else above.
             source=ens_meta.get("source", "noise"),
             zoo_dir=ens_meta.get("zoo_dir"),
+            # Same reasoning one step further: omitted here, a train-only basis
+            # would reload as the whole zoo, every row would shift, and
+            # inverse_transform would decode against a different ensemble than
+            # the PCA was fit on -- silently, because D and the schema still match.
+            member_idxs=ens_meta.get("member_idxs"),
         )
 
     # --- per-family PCA ---------------------------------------------------

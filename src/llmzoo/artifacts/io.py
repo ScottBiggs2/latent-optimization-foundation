@@ -161,6 +161,14 @@ def ensemble_fingerprint(ens_meta: dict) -> str:
     # tests/test_zoo.py::test_noise_source_fingerprint_unchanged is the guard.
     if payload["source"] != "noise":
         payload["zoo_dir"] = ens_meta.get("zoo_dir")
+        # Same conditional discipline, one level down. A member SUBSET is a
+        # different ensemble from the full zoo even at identical N -- the 92
+        # training members of a 100-member zoo are not "a 92-member zoo" -- so
+        # without this a k=91 train-only codes dir could be paired with the
+        # all-100 basis and nothing would notice. Omitted when None so every
+        # full-zoo artifact already on disk keeps its hash.
+        if ens_meta.get("member_idxs") is not None:
+            payload["member_idxs"] = list(ens_meta["member_idxs"])
     return fingerprint(payload)
 
 

@@ -105,6 +105,25 @@ def test_artifact_io() -> None:
     # keep green.
     check("ensemble fp ignores a cosmetic new field",
           aio.ensemble_fingerprint(_ens_meta(note="hello")) == base)
+
+    # --- member subsets -------------------------------------------------
+    # A basis fit on the 92 training members of a 100-member zoo is a DIFFERENT
+    # ensemble from the whole zoo, and from any other 92-member selection. Without
+    # this, codes_k91/ from a train-only fit could be paired with the all-100 PCA
+    # and only the numbers would disagree.
+    zoo = _ens_meta(source="zoo", zoo_dir="/work/zoo_b015", n_samples=4)
+    zoo_fp = aio.ensemble_fingerprint(zoo)
+    check("ensemble fp ignores member_idxs=None (the whole-zoo default)",
+          aio.ensemble_fingerprint({**zoo, "member_idxs": None}) == zoo_fp)
+    check("ensemble fp changes with a member subset",
+          aio.ensemble_fingerprint({**zoo, "member_idxs": [0, 1, 2, 5]}) != zoo_fp)
+    check("ensemble fp separates two subsets of equal size",
+          aio.ensemble_fingerprint({**zoo, "member_idxs": [0, 1, 2, 5]})
+          != aio.ensemble_fingerprint({**zoo, "member_idxs": [0, 1, 2, 6]}))
+    # member_idxs rides inside the source != "noise" branch, so a noise payload
+    # must be untouched by it -- same guard as zoo_dir's.
+    check("member_idxs cannot perturb a noise fingerprint",
+          aio.ensemble_fingerprint(_ens_meta(member_idxs=[0, 1, 2])) == base)
     # float32 reductions are not bit-reproducible across BLAS versions, so weight_std
     # is rounded before hashing.
     check("ensemble fp tolerates weight_std jitter below 1e-9",

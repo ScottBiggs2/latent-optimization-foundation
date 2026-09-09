@@ -55,7 +55,7 @@ import gc
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -177,9 +177,13 @@ class ZooSource(MemberSource):
         return self._mm[key]
 
     def load_rows(self, ds, arch, chunk_idx, r0, r1, device, w0_mm):
-        out = torch.empty((ds.n_samples, r1 - r0), device=device, dtype=torch.float32)
-        for i in range(ds.n_samples):
-            out[i] = torch.from_numpy(np.array(self._member(arch, i)[r0:r1])).to(device)
+        # ROW j is MEMBER ds.members[j], which is only the identity when the run
+        # uses the whole zoo. Every downstream join -- codes row -> pi, codes row
+        # -> holdout membership -- goes through the same list.
+        members = ds.members
+        out = torch.empty((len(members), r1 - r0), device=device, dtype=torch.float32)
+        for j, i in enumerate(members):
+            out[j] = torch.from_numpy(np.array(self._member(arch, i)[r0:r1])).to(device)
         return out
 
     def state(self) -> dict:
@@ -252,6 +256,19 @@ class EnsembleDataset:
                     ENSEMBLE_SOURCES.
     zoo_dir       : required when source='zoo'. Expects <zoo_dir>/<arch>/w_<i>.npy
                     for i in 0..n_samples-1, all the same length.
+    member_idxs   : optional explicit member list for source='zoo'. Row j of every
+                    chunk, and therefore row j of the PCA codes, is member
+                    member_idxs[j]. `n_samples` is DERIVED from it.
+
+                    This is what lets a basis be fit on a strict subset -- the 92
+                    training members of a 100-member zoo, with the sealed holdout
+                    genuinely outside the span rather than merely outside the
+                    flow's training rows. It is recorded in ensemble_meta.json and
+                    folded into ensemble_fingerprint, so a subset basis cannot be
+                    paired with full-zoo codes.
+
+                    Meaningless for source='noise', where member i IS the noise
+                    drawn for index i, so it is refused there.
     """
 
     def __init__(
@@ -268,15 +285,33 @@ class EnsembleDataset:
         force_extract: bool = False,
         source: str = "noise",
         zoo_dir: Optional[str] = None,
+        member_idxs: Optional[Sequence[int]] = None,
     ):
         if arch_list is None:
             arch_list = list_archs()
+
+        if member_idxs is not None:
+            if str(source) == "noise":
+                raise ValueError(
+                    "member_idxs is only meaningful for source='zoo'. A noise "
+                    "member IS the noise drawn for its index, so a subset of "
+                    "indices is a different ensemble, not a subset of one.")
+            member_idxs = [int(i) for i in member_idxs]
+            if len(set(member_idxs)) != len(member_idxs):
+                raise ValueError("member_idxs contains duplicates.")
+            if any(i < 0 for i in member_idxs):
+                raise ValueError("member_idxs contains a negative index.")
+            # n_samples is DERIVED, never cross-checked: two sources of truth for
+            # the ensemble size is how a basis silently gets fit on the wrong rows.
+            n_samples = len(member_idxs)
+
         if n_samples < 3:
             raise ValueError(f"n_samples must be >= 3 to leave a usable rank "
                              f"(N-1 components); got {n_samples}")
 
         self.arch_list = list(arch_list)
         self.n_samples = int(n_samples)
+        self.member_idxs = member_idxs
         self.noise_scale = float(noise_scale)
         self.exclude_1d = bool(exclude_1d)
         self.include_extra = bool(include_extra)
@@ -306,6 +341,23 @@ class EnsembleDataset:
             self._load_meta(meta_path)
         else:
             self._extract(meta_path)
+
+    # ------------------------------------------------------------------
+    # Row <-> member
+    # ------------------------------------------------------------------
+
+    @property
+    def members(self) -> List[int]:
+        """
+        Member index per ROW, in row order. `list(range(n_samples))` unless a
+        subset was requested.
+
+        Every consumer that needs "which model is this row" goes through here
+        rather than assuming row == member, which is true only for a whole zoo.
+        """
+        if self.member_idxs is None:
+            return list(range(self.n_samples))
+        return list(self.member_idxs)
 
     # ------------------------------------------------------------------
     # Extraction / metadata
@@ -415,13 +467,23 @@ class EnsembleDataset:
                 raise RuntimeError(
                     f"{zmeta_path}: zoo was flattened with {key}={z.get(key)!r} but "
                     f"this run asks for {mine!r}. Re-flatten or change the flag.")
-        if int(z["n_members"]) < self.n_samples:
-            raise RuntimeError(
-                f"{arch}: zoo has {z['n_members']} members, run asks for "
-                f"n_samples={self.n_samples}.")
+        n_have = int(z["n_members"])
+        members = self.members
+        if self.member_idxs is None:
+            if n_have < self.n_samples:
+                raise RuntimeError(
+                    f"{arch}: zoo has {n_have} members, run asks for "
+                    f"n_samples={self.n_samples}.")
+        else:
+            over = [i for i in members if i >= n_have]
+            if over:
+                raise RuntimeError(
+                    f"{arch}: member_idxs asks for {over[:5]}"
+                    f"{' …' if len(over) > 5 else ''} but the zoo has only "
+                    f"{n_have} members (0..{n_have - 1}).")
 
         D = int(z["n_params"])
-        for i in range(self.n_samples):
+        for i in members:
             p = self._src.member_path(arch, i)
             if not os.path.exists(p):
                 raise FileNotFoundError(f"{arch}: member {i} missing at {p}")
@@ -444,9 +506,11 @@ class EnsembleDataset:
             # there is no noise. Kept so the metadata schema is uniform.
             weight_std=float(z.get("weight_std", 0.0)),
             schema=[ParamEntry(n, tuple(s)) for n, s in z["schema"]],
-            # Member 0 is an ARBITRARY member, not a centre. It is the write-back
+            # Row 0 is an ARBITRARY member, not a centre. It is the write-back
             # reference only. misstep 9's sample_idx warning does not apply here.
-            w0_path=self._src.member_path(arch, 0),
+            # Under a subset it is members[0], not member 0 -- member 0 may not
+            # even be in the ensemble.
+            w0_path=self._src.member_path(arch, members[0]),
             extra_size=int(z.get("extra_size", 0)),
             extra_schema=[ParamEntry(n, tuple(s))
                           for n, s in z.get("extra_schema", [])],
@@ -471,6 +535,10 @@ class EnsembleDataset:
             # fingerprints byte-identically to one written before Phase 0.3.
             **({} if self.source == "noise"
                else {"source": self.source, "zoo_dir": self.zoo_dir}),
+            # Same rule again: written only when a subset was requested, so a
+            # whole-zoo meta is byte-identical to one written before this existed.
+            **({} if self.member_idxs is None
+               else {"member_idxs": list(self.member_idxs)}),
             "stacks": {
                 a: {
                     "family_idx": s.family_idx,
@@ -524,6 +592,24 @@ class EnsembleDataset:
                     f"but this run asks for {mine!r}. The ensemble contents depend on "
                     f"it. Pass force_extract=True or use a fresh --artifact_dir."
                 )
+        # WHICH zoo, and WHICH members of it. Neither was compared before, and both
+        # fail silently rather than loudly: `n_samples` alone cannot tell a
+        # 92-member subset from a different 92-member zoo, and w0_path is restored
+        # from the cache, so a run_name pointed at a second zoo would quietly score
+        # against the first one's basis. Every sweep cell reuses a run_name shape,
+        # which is exactly the traffic this guards.
+        if self.source != "noise":
+            for key, mine in (("zoo_dir", self.zoo_dir),
+                              ("member_idxs",
+                               None if self.member_idxs is None
+                               else list(self.member_idxs))):
+                if meta.get(key) != mine:
+                    raise RuntimeError(
+                        f"Refusing to reuse {self.ens_dir}: cached "
+                        f"{key}={meta.get(key)!r} but this run asks for {mine!r}. "
+                        f"These are different ensembles. Use a different "
+                        f"--run_name, or pass force_extract=True.")
+
         missing = [a for a in self.arch_list if a not in meta["stacks"]]
         if missing:
             raise RuntimeError(f"Cached ensemble lacks {missing}; re-extract.")
@@ -625,12 +711,16 @@ class EnsembleDataset:
         For source='zoo' every member is already a file, and no member is at a
         privileged centre, so that warning does not apply and any index is
         representative.
+
+        `idx` is a ROW index, matching the rows of the PCA codes. Under a member
+        subset that is not the member number -- row j is member members[j].
         """
         if not (0 <= idx < self.n_samples):
             raise IndexError(f"sample {idx} out of range (0..{self.n_samples - 1})")
         if self.source == "zoo":
-            return np.array(np.load(self._src.member_path(arch, idx), mmap_mode="r"),
-                            dtype=np.float32)
+            member = self.members[idx]
+            return np.array(np.load(self._src.member_path(arch, member),
+                                    mmap_mode="r"), dtype=np.float32)
         out = np.empty(self.stacks[arch].n_params, dtype=np.float32)
         w0_mm = self.w0(arch)
         for ci, (r0, r1) in enumerate(self.chunk_bounds(arch)):
@@ -646,6 +736,11 @@ class EnsembleDataset:
         lines = [f"EnsembleDataset  source={self.source}  N={self.n_samples}  "
                  f"noise_scale={self.noise_scale}  exclude_1d={self.exclude_1d}  "
                  f"include_extra={self.include_extra}"]
+        if self.member_idxs is not None:
+            m = self.members
+            lines.append(f"  members  : SUBSET of {len(m)} — "
+                         f"{m[:6]}{' …' if len(m) > 6 else ''} "
+                         f"(row j is member members[j], NOT j)")
         for a in self.arch_list:
             s = self.stacks[a]
             nb = len(self.chunk_bounds(a))

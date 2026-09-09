@@ -515,6 +515,7 @@ def main() -> int:
     p.add_argument("--peak_tflops", type=float, default=1662.4)
     p.add_argument("--no_wandb", action="store_true",
                    help="disable W&B. Matches train_stack/train_flow/eval_stack.")
+    wb.add_wandb_args(p)
     args = p.parse_args()
 
     if args.verify_domains or args.verify_mixture or args.mode == "verify":
@@ -585,7 +586,9 @@ def main() -> int:
         wb.init_run(job_type="zoo_trunk", config=vars(args),
                     tags=[args.arch, tag, "trunk"],
                     enabled=not args.no_wandb, artifact_dir=zoo_dir,
-                    name_suffix=f"{tag}_trunk", group=group)
+                    name_suffix=f"{tag}_trunk",
+                    group=args.wandb_group or group,
+                    project=args.wandb_project)
         wb.summary({"arch": args.arch, "beta": args.beta,
                     "n_params": counts["total"],
                     "embedding_fraction": counts["embedding_fraction"],
@@ -693,7 +696,9 @@ def main() -> int:
     wb.init_run(job_type="zoo_branch", config={**vars(args), **m},
                 tags=[args.arch, tag, m["kind"], m["mixture_id"]],
                 enabled=not args.no_wandb, artifact_dir=zoo_dir,
-                name_suffix=f"{tag}_member{args.member_idx:03d}", group=group)
+                name_suffix=f"{tag}_member{args.member_idx:03d}",
+                group=args.wandb_group or group,
+                project=args.wandb_project)
     wb.summary({"arch": args.arch, "beta": args.beta,
                 "member_idx": args.member_idx, "kind": m["kind"],
                 "mixture_id": m["mixture_id"], "branch": m["branch"],

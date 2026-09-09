@@ -50,7 +50,9 @@ from llmzoo.artifacts.io import (
 )
 from llmzoo.gen.flow import FlowVelocityNet, RectifiedFlow, build_space, save_flow
 from llmzoo.models.registry import N_FAMILIES
-from llmzoo.artifacts.bundle import load_run, update_manifest_section
+from llmzoo.artifacts.bundle import (
+    load_pi_matrix, load_run, update_manifest_section,
+)
 import llmzoo.wandb_utils as wb
 
 
@@ -89,7 +91,12 @@ def train(args) -> None:
         raise SystemExit(f"No ensemble under {run_root}. Run train_stack.py first.")
 
     k = args.k if args.k is not None else ens_meta["n_samples"] - 1
-    out_dir = os.path.join(run_root, f"flow_k{k}_{args.space}")
+    # The suffix keeps a pi flow beside its family-conditioned twin instead of
+    # overwriting it. That pair IS section 6.2's control: identical codes,
+    # identical net, identical epochs, conditioning present or absent -- and on a
+    # one-architecture zoo the family flow is genuinely unconditional.
+    suffix = "" if args.cond_mode == "family" else f"_{args.cond_mode}"
+    out_dir = os.path.join(run_root, f"flow_k{k}_{args.space}{suffix}")
     if os.path.exists(os.path.join(out_dir, "flow_meta.json")) and not args.force:
         raise SystemExit(
             f"{out_dir} already holds a sealed flow. Pass --force to overwrite.")
@@ -111,6 +118,23 @@ def train(args) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     codes = torch.from_numpy(cs.codes).float().to(device)
     fidx = torch.from_numpy(cs.family_idxs).long().to(device)
+
+    # --- the conditioning variable ----------------------------------------
+    # In a single-arch zoo every member shares one family_idx, so cond_mode="family"
+    # is literally unconditional. pi is the mixture the member was actually trained
+    # on, joined row -> member -> zoo_meta (bundle.load_pi_matrix).
+    pi_all = pi_meta = None
+    if args.cond_mode == "pi":
+        pi_meta = load_pi_matrix(ens_meta)
+        pi_np = pi_meta["pi"]
+        if pi_np.shape[0] != codes.shape[0]:
+            raise SystemExit(
+                f"pi has {pi_np.shape[0]} rows but codes has {codes.shape[0]}. "
+                f"The row->member join is broken; refusing to train on a scrambled "
+                f"pairing, which would look like 'conditioning does not generalise'.")
+        pi_all = torch.from_numpy(pi_np).float().to(device)
+        print(f"  pi         : {tuple(pi_np.shape)} over {pi_meta['domains']}\n"
+              f"               fingerprint {pi_meta['fingerprint']}")
 
     spectrum = spectrum_from_summary(run_root, k)
     ratios = {a: d["ev0_over_median"] for a, d in spectrum.items()
@@ -139,7 +163,9 @@ def train(args) -> None:
     net = FlowVelocityNet(
         dim=space.dim, n_families=N_FAMILIES, cond_dim=args.cond_dim,
         hidden_dims=tuple(args.hidden_dims), time_embed_dim=args.time_embed_dim,
-        cond_dropout_p=args.cond_dropout).to(device)
+        cond_dropout_p=args.cond_dropout,
+        cond_mode=args.cond_mode,
+        pi_dim=(pi_all.shape[1] if pi_all is not None else 5)).to(device)
     flow = RectifiedFlow(net, source_std=args.source_std,
                          path_noise=args.path_noise).to(device)
 
@@ -182,8 +208,13 @@ def train(args) -> None:
 
     x_tr, f_tr = x1_all[train_mask], fidx[train_mask]
     x_va, f_va = x1_all[~train_mask], fidx[~train_mask]
+    # A third tensor rather than a lookup: the loader shuffles, so pi has to travel
+    # WITH its row or the pairing is lost the first time a batch is drawn.
+    pi_tr = pi_all[train_mask] if pi_all is not None else None
+    pi_va = pi_all[~train_mask] if pi_all is not None else None
 
-    loader = DataLoader(TensorDataset(x_tr, f_tr),
+    parts = [x_tr, f_tr] + ([pi_tr] if pi_tr is not None else [])
+    loader = DataLoader(TensorDataset(*parts),
                         batch_size=min(args.batch_size, x_tr.shape[0]),
                         shuffle=True)
     opt = torch.optim.AdamW(flow.parameters(), lr=args.lr,
@@ -218,27 +249,93 @@ def train(args) -> None:
 
     target_rms = float(x1_all.pow(2).mean().sqrt())
 
-    def _rms_ratio() -> Optional[float]:
-        """Sample spread against the training target's, in flow-space units.
+    # --- what "correct dispersion" means, and why it depends on the mode ----
+    #
+    # The pooled ratio compares the spread of SAMPLES to the spread of the whole
+    # training set. Under cond_mode="family" on a one-family zoo the conditioning is
+    # constant, so those are the same population and 1.0 is the right answer.
+    #
+    # Under cond_mode="pi" they are NOT. Samples at a FIXED pi have the conditional
+    # spread; the target has the pooled spread, which also contains all the
+    # between-mixture variation. PHASE2_RESULTS section 5 measures between/within at
+    # ~3.96, so a PERFECT pi-conditioned flow lands near
+    #
+    #     1 / sqrt(1 + 3.96^2) ~ 0.25
+    #
+    # and 0.25 is numerically the same number misstep 19 recorded for a genuinely
+    # collapsed flow. Reporting only the pooled ratio would therefore tag a correct
+    # result [COLLAPSED] and a real collapse [COLLAPSED] identically.
+    #
+    # So emit BOTH, and say which reference each used:
+    #   pooled      -- sample at the TRAINING pi's, compare to the pooled target.
+    #                  Continuity with every historical number. ~1.0 is correct in
+    #                  either mode, because the conditioning distribution matches.
+    #   at_fixed_pi -- sample at ONE anchor's pi, compare to that anchor's own
+    #                  within-group spread. This is the number that catches
+    #                  memorisation-as-point-mass, which is pi-conditioning's own
+    #                  failure mode (CcGAN: one real sample per label).
+    anchor_rows = None
+    if pi_all is not None:
+        # An anchor group is >= 2 rows sharing one pi. That is exactly what the 20
+        # anchors were provisioned for (RESEARCH_PLAN 6.3's within-mixture noise
+        # floor); the 80 singletons have one member each and cannot supply it.
+        keys: Dict[tuple, list] = {}
+        for j, row in enumerate(pi_all.detach().cpu().numpy()):
+            keys.setdefault(tuple(np.round(row, 6)), []).append(j)
+        groups = sorted((v for v in keys.values() if len(v) > 1), key=len,
+                        reverse=True)
+        if groups:
+            anchor_rows = groups[0]
+            blk = x1_all[anchor_rows]
+            within_rms = float((blk - blk.mean(dim=0, keepdim=True))
+                               .pow(2).mean().sqrt())
+            print(f"  within-pi  : anchor group of {len(anchor_rows)} rows, "
+                  f"reference rms {within_rms:.4g} (pooled {target_rms:.4g}, "
+                  f"ratio {within_rms / max(target_rms, 1e-12):.3f})")
+        else:
+            within_rms = None
+            print("  within-pi  : no repeated pi in the training rows — the "
+                  "conditional dispersion reference is unavailable.")
+    else:
+        within_rms = None
 
-        Logged every epoch it is cheap enough to matter: this is the only number
-        in the loop that goes the WRONG way as the loss improves, so leaving it out
-        of the training log is what let the collapse ship unnoticed.
+    def _rms_ratio(fixed_pi: bool = False) -> Optional[float]:
+        """Sample spread against a training-set reference, in flow-space units.
+
+        This is the only number in the loop that goes the WRONG way as the loss
+        improves, which is why it is logged rather than computed at the end.
         """
         if args.dispersion_n < 1:
             return None
+        n = args.dispersion_n
         flow.eval()
         with torch.no_grad():
-            fv = f_tr[:1].expand(args.dispersion_n).contiguous()
-            xs = flow.sample(args.dispersion_n, fv, n_steps=args.n_steps)
+            if pi_all is None:
+                fv = f_tr[:1].expand(n).contiguous()
+                xs = flow.sample(n, fv, n_steps=args.n_steps)
+                return float(xs.pow(2).mean().sqrt()) / max(target_rms, 1e-12)
+            if fixed_pi:
+                if anchor_rows is None or not within_rms:
+                    return None
+                fv = fidx[anchor_rows[:1]].expand(n).contiguous()
+                pv = pi_all[anchor_rows[:1]].expand(n, -1).contiguous()
+                xs = flow.sample(n, fv, n_steps=args.n_steps, pi=pv)
+                dev = xs - xs.mean(dim=0, keepdim=True)
+                return float(dev.pow(2).mean().sqrt()) / max(within_rms, 1e-12)
+            # Pooled: draw the conditioning from the SAME distribution the target
+            # was pooled over, so the two are comparable again.
+            sel = torch.randint(0, x_tr.shape[0], (n,), device=x_tr.device)
+            xs = flow.sample(n, f_tr[sel], n_steps=args.n_steps, pi=pi_tr[sel])
         return float(xs.pow(2).mean().sqrt()) / max(target_rms, 1e-12)
 
     for epoch in range(1, args.epochs + 1):
         flow.train()
         tot, nb = 0.0, 0
-        for xb, fb in loader:
+        for batch in loader:
+            xb, fb = batch[0], batch[1]
+            pb = batch[2] if len(batch) > 2 else None
             opt.zero_grad()
-            loss, _ = flow.loss(xb, fb)
+            loss, _ = flow.loss(xb, fb, pi=pb)
             loss.backward()
             nn.utils.clip_grad_norm_(flow.parameters(), 1.0)
             opt.step()
@@ -252,7 +349,7 @@ def train(args) -> None:
             with torch.no_grad():
                 # Averaged over several t draws: a single draw makes the val curve
                 # dominated by which t happened to be sampled, not by the model.
-                val = float(np.mean([float(flow.loss(x_va, f_va)[0])
+                val = float(np.mean([float(flow.loss(x_va, f_va, pi=pi_va)[0])
                                      for _ in range(8)]))
 
         gate = val if val is not None else tot
@@ -299,6 +396,17 @@ def train(args) -> None:
     # Measured on the SELECTED weights, not the last epoch's -- the whole point is
     # that checkpoint selection can pick a collapsed model.
     final_rms_ratio = _rms_ratio()
+    final_rms_at_pi = _rms_ratio(fixed_pi=True)
+    if final_rms_at_pi is not None:
+        v2 = ("COLLAPSED" if final_rms_at_pi < 0.5 else
+              "shrunken" if final_rms_at_pi < 0.8 else
+              "over-dispersed" if final_rms_at_pi > 1.25 else "ok")
+        print(f"  rms at a fixed pi : {final_rms_at_pi:.3f}x that mixture's own "
+              f"within-group spread  [{v2}]")
+        print("    This is the memorisation read, and it is the one the pooled "
+              "ratio below\n    cannot make: a flow that has learned one point per "
+              "mixture still spreads\n    correctly ACROSS mixtures, so its pooled "
+              "ratio is a healthy 1.0.")
     if final_rms_ratio is not None:
         verdict = ("COLLAPSED" if final_rms_ratio < 0.5 else
                    "shrunken" if final_rms_ratio < 0.8 else
@@ -321,8 +429,27 @@ def train(args) -> None:
     # Round-trip residual in FLOW SPACE at the sealed step count. Not a gate -- L2
     # does not predict functional damage (misstep 13) -- but a large value here means
     # the ODE is not self-consistent and no dPPL number downstream will be readable.
+    # --- did pi reach the right rows? -------------------------------------
+    # A scrambled row->member join trains on shuffled conditioning and yields a FLAT
+    # section 6.5 slope, which is indistinguishable after the fact from an honest
+    # negative result. This correlates pairwise mixture distance against pairwise
+    # code distance: if the pairing is real it is clearly positive, and if the rows
+    # were shuffled it is ~0. It is a PAIRING check, independent of whether the flow
+    # learned anything, and at M=100 it is a 100x100 computation, i.e. free.
+    pi_corr = None
+    if pi_all is not None and x1_all.shape[0] > 2:
+        with torch.no_grad():
+            dp = torch.cdist(pi_all, pi_all, p=1)
+            dx = torch.cdist(x1_all, x1_all, p=2)
+            iu = torch.triu_indices(dp.shape[0], dp.shape[0], offset=1)
+            a, b = dp[iu[0], iu[1]], dx[iu[0], iu[1]]
+            a = a - a.mean(); b = b - b.mean()
+            pi_corr = float((a @ b) / (a.norm() * b.norm() + 1e-12))
+        print(f"\n  pi<->code distance corr : {pi_corr:+.4f}  "
+              f"{'OK' if pi_corr > 0.1 else 'SUSPECT — is the row join right?'}")
+
     with torch.no_grad():
-        _, _, diag = flow.round_trip(x1_all, fidx, n_steps=args.n_steps)
+        _, _, diag = flow.round_trip(x1_all, fidx, n_steps=args.n_steps, pi=pi_all)
     print(f"\n  round-trip rel_l2 in {args.space} space at {args.n_steps} steps: "
           f"{diag['rel_l2_space']:.4g}")
     print(f"  reverse pass landed at rms {diag['x0_hat_rms']:.4g} "
@@ -351,12 +478,20 @@ def train(args) -> None:
                     # Sealed so a collapsed flow carries the evidence forever, the
                     # same way it carries the flat spectrum it was trained on.
                     "code_rms_ratio": final_rms_ratio,
+                    "code_rms_reference": ("pooled_at_training_pi"
+                                           if pi_all is not None else "pooled"),
+                    "code_rms_ratio_at_fixed_pi": final_rms_at_pi,
+                    "n_anchor_rows": (len(anchor_rows) if anchor_rows else 0),
+                    "pi_code_distance_corr": pi_corr,
                     "gated_on": "val_loss" if x_va.shape[0] > 0 else "train_loss",
                     "round_trip": diag,
                     "spectrum": spectrum,
                     "history": history},
         defaults={"n_steps": args.n_steps,
-                  "guidance_scale": args.eval_guidance_scale})
+                  "guidance_scale": args.eval_guidance_scale},
+        cond_meta=({"domains": pi_meta["domains"],
+                    "pi_fingerprint": pi_meta["fingerprint"],
+                    "zoo_dir": pi_meta["zoo_dir"]} if pi_meta else None))
 
     update_manifest_section(run_root, "flow", str(k), {
         **( (read_json(os.path.join(run_root, "run_manifest.json")) or {})
@@ -365,7 +500,9 @@ def train(args) -> None:
                      "layout_version": meta["layout_version"],
                      "dim": meta["dim"], "trust": trust,
                      "n_steps_default": args.n_steps,
+                     "cond_mode": args.cond_mode,
                      "code_rms_ratio": final_rms_ratio,
+                     "code_rms_ratio_at_fixed_pi": final_rms_at_pi,
                      "spectrum": spectrum},
     })
 
@@ -398,6 +535,14 @@ def main() -> None:
     p.add_argument("--hidden_dims", nargs="+", type=int, default=[256, 512, 256])
     p.add_argument("--time_embed_dim", type=int, default=64)
     p.add_argument("--cond_dim", type=int, default=64)
+    p.add_argument("--cond_mode", choices=["family", "pi"], default="family",
+                   help="What the velocity field is conditioned on. 'family' "
+                        "is an nn.Embedding row per architecture -- which in a "
+                        "single-arch zoo is a CONSTANT, i.e. unconditional. "
+                        "'pi' feeds the member's pretraining mixture through a "
+                        "small MLP (RESEARCH_PLAN 6.2), which is what makes an "
+                        "unseen mixture the same kind of object as a seen one. "
+                        "Needs --source zoo; pi is read from zoo_meta.json.")
     p.add_argument("--cond_dropout", type=float, default=0.15,
                    help="Blanks the family embedding during training so a learned "
                         "null branch exists. That branch is what makes CFG possible "
@@ -451,6 +596,7 @@ def main() -> None:
     p.add_argument("--force", action="store_true")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--no_wandb", action="store_true")
+    wb.add_wandb_args(p)
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -460,7 +606,8 @@ def main() -> None:
     wb.init_run(job_type="train_flow", config=vars(args),
                 tags=["flow", args.space, args.run_name, f"k{k_tag}"],
                 enabled=not args.no_wandb, artifact_dir=args.artifact_dir,
-                name_suffix=f"{args.run_name}_k{k_tag}_{args.space}")
+                name_suffix=f"{args.run_name}_k{k_tag}_{args.space}",
+                project=args.wandb_project, group=args.wandb_group)
     train(args)
     wb.finish()
 
