@@ -23,16 +23,40 @@ So measure the geometry instead. The quantities that matter:
 
   mean_frac   ||w_i - mean|| / mean ||w_i - w_j||
               sqrt((N-1)/N / 2) for an i.i.d. spread -- 0.677 at N=12, ->0.707
-              as N grows. Much lower means every member
-              sits near the centroid, so decoding the mean scores like a member
-              and dPPL cannot police the generative arm.
+              as N grows. Much lower means every member sits near the centroid,
+              so decoding the mean scores like a member and dPPL cannot police
+              the generative arm.
 
-  between/within   inter-anchor-group distance / intra-group distance.
-              The weight-space analogue of the gate's SNR, on the quantity a
-              PCA basis is actually built from.
+  between/within   inter-group distance / intra-group distance, over the groups
+              that HAVE a within (i.e. the anchors). The weight-space analogue
+              of the gate's SNR, on the quantity a PCA basis is actually built
+              from.
 
-Reads .npy members with mmap and streams in chunks, so peak RSS stays near one
-member rather than N.
+--------------------------------------------------------------------------------
+HOW THIS SCALES, AND WHY IT HAD TO BE REWRITTEN FOR N=100
+--------------------------------------------------------------------------------
+The first version materialised `blk[i] - blk[j]` for every pair in every chunk.
+At N=12 that is 66 pairs and it ran in 35 s. At N=100 it is 4950 pairs over
+D=51.5M, i.e. ~255 G float64 element-ops in pure numpy -- hours, and it also
+held N chunks of float64 at once (3.2 GB at chunk=4M, N=100).
+
+Every quantity above comes out of an N x N Gram instead, in ONE streaming pass
+and one BLAS call per chunk.
+
+The Gram is taken of the DISPLACEMENTS d_i = w_i - ref, not of w_i, and that is
+a numerical choice rather than a convenience. Every member descends from one
+trunk, so ||w_i - w_j|| is 16-56% of ||w_i|| (measured, Phase 1). Recovering a
+small difference from `G_ii + G_jj - 2 G_ij` on RAW vectors is catastrophic
+cancellation; on displacements the Gram entries are already the scale of the
+answer, so nothing cancels. Identities used, all exact:
+
+    ||w_i - w_j||^2 = G_ii + G_jj - 2 G_ij                    (ref cancels)
+    ||w_i - ref||^2 = G_ii
+    ||w_i - mean||^2 = G_ii - (2/N) sum_j G_ij + (1/N^2) sum_jk G_jk
+    ||w_i||^2       = G_ii + 2 t_i + ||ref||^2 ,  t_i = d_i . ref
+
+Reads .npy members with mmap and streams in chunks, so peak RSS is one (N, chunk)
+float64 block rather than the whole ensemble.
 """
 
 from __future__ import annotations
@@ -71,7 +95,12 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--zoo_dir", required=True, help="the ARCH-level dir")
-    p.add_argument("--chunk", type=int, default=4_000_000)
+    p.add_argument("--chunk_bytes", type=float, default=1.5e9,
+                   help="peak size of the (N, chunk) float64 working block. The "
+                        "chunk length is derived from this and N, so N=12 and "
+                        "N=100 both stay inside one --mem=200G job.")
+    p.add_argument("--chunk", type=int, default=None,
+                   help="override the derived chunk length in ELEMENTS")
     p.add_argument("--json_out", default=None)
     args = p.parse_args()
 
@@ -88,6 +117,7 @@ def main() -> int:
     idx = [int(p.rsplit("_", 1)[1].split(".")[0]) for p in paths]
     plan = {m["idx"]: m for m in zmeta["members"]}
     group = {i: plan[i]["mixture_id"] for i in idx}
+    kind = {i: plan[i]["kind"] for i in idx}
 
     trunk = None
     tp = os.path.join(args.zoo_dir, "trunk.pt")
@@ -98,51 +128,74 @@ def main() -> int:
             print(f"  trunk D={trunk.shape[0]} != member D={D}; ignoring trunk")
             trunk = None
 
-    # Streamed accumulation: pairwise sq distances, norms, and the mean.
-    pairs = list(itertools.combinations(range(N), 2))
-    sq = {pr: 0.0 for pr in pairs}
-    nrm = [0.0] * N
-    to_trunk = [0.0] * N
-    tnorm = 0.0
-    mean = np.zeros(D, dtype=np.float64)
+    # Reference for the displacement Gram. The trunk when we have it (it is also
+    # the thing `disp` is measured against); member 0 otherwise, which still
+    # gives exact pairwise distances because the reference cancels in
+    # G_ii + G_jj - 2 G_ij -- it just cannot give `disp` or `spread/disp`.
+    ref = trunk if trunk is not None else np.asarray(members[0], dtype=np.float64)
+    ref_name = "trunk" if trunk is not None else "member_0"
 
-    for s in range(0, D, args.chunk):
-        e = min(s + args.chunk, D)
-        blk = [np.asarray(m[s:e], dtype=np.float64) for m in members]
-        for i, b in enumerate(blk):
-            nrm[i] += float(b @ b)
-            mean[s:e] += b
-        if trunk is not None:
-            t = np.asarray(trunk[s:e], dtype=np.float64)
-            tnorm += float(t @ t)
-            for i, b in enumerate(blk):
-                d = b - t
-                to_trunk[i] += float(d @ d)
-        for i, j in pairs:
-            d = blk[i] - blk[j]
-            sq[(i, j)] += float(d @ d)
-    mean /= N
+    chunk = args.chunk or max(1, int(args.chunk_bytes // (8 * N)))
+    n_chunks = (D + chunk - 1) // chunk
+    print(f"[geom] N={N} D={D:,} ref={ref_name}  {n_chunks} chunks of "
+          f"<= {chunk:,} elems ({8 * N * chunk / 1e9:.2f} GB working block)",
+          flush=True)
 
-    to_mean = [0.0] * N
-    for s in range(0, D, args.chunk):
-        e = min(s + args.chunk, D)
-        mu = mean[s:e]
+    G = np.zeros((N, N), dtype=np.float64)   # Gram of the displacements
+    t = np.zeros(N, dtype=np.float64)        # d_i . ref
+    ref_sq = 0.0
+
+    for ci, s in enumerate(range(0, D, chunk)):
+        e = min(s + chunk, D)
+        r = np.asarray(ref[s:e], dtype=np.float64)
+        Dm = np.empty((N, e - s), dtype=np.float64)
         for i, m in enumerate(members):
-            d = np.asarray(m[s:e], dtype=np.float64) - mu
-            to_mean[i] += float(d @ d)
+            # copy out of the memmap, then subtract in place -- one temporary,
+            # not one per member per pair as the old inner loop had.
+            Dm[i, :] = m[s:e]
+        Dm -= r
+        G += Dm @ Dm.T
+        t += Dm @ r
+        ref_sq += float(r @ r)
+        del Dm, r
+        if n_chunks <= 20 or ci % max(1, n_chunks // 10) == 0:
+            print(f"  chunk {ci + 1}/{n_chunks}", flush=True)
 
-    nrm = np.sqrt(nrm); to_mean = np.sqrt(to_mean)
-    pd = {pr: np.sqrt(v) for pr, v in sq.items()}
-    tnorm = np.sqrt(tnorm) if trunk is not None else None
-    to_trunk = np.sqrt(to_trunk) if trunk is not None else None
+    diag = np.diag(G).copy()
+    to_ref = np.sqrt(np.clip(diag, 0.0, None))
+    # ||w_i||^2 = ||d_i + ref||^2
+    nrm = np.sqrt(np.clip(diag + 2.0 * t + ref_sq, 0.0, None))
+    # ||w_i - mean||^2, from the Gram alone
+    rowsum = G.sum(axis=1)
+    total = float(G.sum())
+    to_mean = np.sqrt(np.clip(diag - 2.0 * rowsum / N + total / (N * N),
+                              0.0, None))
 
-    within = [pd[(i, j)] for i, j in pairs if group[idx[i]] == group[idx[j]]]
-    between = [pd[(i, j)] for i, j in pairs if group[idx[i]] != group[idx[j]]]
+    pairs = list(itertools.combinations(range(N), 2))
+    pd = {(i, j): float(np.sqrt(max(diag[i] + diag[j] - 2.0 * G[i, j], 0.0)))
+          for i, j in pairs}
+
+    # between/within over the groups that HAVE a within. Singletons each carry a
+    # unique mixture_id, so counting singleton-singleton pairs as "between"
+    # would silently redefine the statistic between N=12 (all anchors) and
+    # N=100 (20 anchors + 80 unique singletons) and destroy comparability with
+    # the Phase 1 table. Restricting to multi-member groups reproduces Phase 1
+    # exactly and stays meaningful at N=100.
+    sizes = {}
+    for i in idx:
+        sizes[group[i]] = sizes.get(group[i], 0) + 1
+    multi = {g for g, c in sizes.items() if c > 1}
+    within = [pd[(i, j)] for i, j in pairs
+              if group[idx[i]] == group[idx[j]] and group[idx[i]] in multi]
+    between = [pd[(i, j)] for i, j in pairs
+               if group[idx[i]] != group[idx[j]]
+               and group[idx[i]] in multi and group[idx[j]] in multi]
     allpd = list(pd.values())
 
     out = {
         "zoo_dir": args.zoo_dir, "arch": arch, "beta": zmeta.get("beta"),
         "n_members": N, "D": D,
+        "reference": ref_name, "n_chunks": n_chunks, "chunk": chunk,
         "member_norm_mean": float(np.mean(nrm)),
         "pairwise_mean": float(np.mean(allpd)),
         "pairwise_min": float(np.min(allpd)),
@@ -150,15 +203,20 @@ def main() -> int:
         "between_group_mean": float(np.mean(between)) if between else None,
         "between_over_within": (float(np.mean(between) / np.mean(within))
                                 if within and between else None),
+        "n_within_pairs": len(within),
+        "n_between_pairs": len(between),
+        "n_multi_member_groups": len(multi),
+        "n_anchor_members": sum(1 for i in idx if kind[i] == "anchor"),
+        "n_singleton_members": sum(1 for i in idx if kind[i] == "singleton"),
         "to_mean_mean": float(np.mean(to_mean)),
         "mean_frac": float(np.mean(to_mean) / np.mean(allpd)),
     }
     if trunk is not None:
         out.update({
-            "trunk_norm": float(tnorm),
-            "to_trunk_mean": float(np.mean(to_trunk)),
-            "disp_rel": float(np.mean(to_trunk) / tnorm),
-            "spread_over_disp": float(np.mean(allpd) / np.mean(to_trunk)),
+            "trunk_norm": float(np.sqrt(ref_sq)),
+            "to_trunk_mean": float(np.mean(to_ref)),
+            "disp_rel": float(np.mean(to_ref) / np.sqrt(ref_sq)),
+            "spread_over_disp": float(np.mean(allpd) / np.mean(to_ref)),
         })
 
     print("\n" + "=" * 70)
@@ -171,12 +229,23 @@ def main() -> int:
               f"{out['spread_over_disp']:.3f}")
         print(f"      sqrt(2)=1.414 means members moved INDEPENDENTLY.")
         print(f"      near 0 means they all moved the SAME direction -> one-dimensional zoo.")
+    else:
+        print(f"  no trunk.pt here, so displacement is undefined; pairwise "
+              f"distances are still exact (the reference cancels).")
     print(f"  centroid fraction         ||w_i-mean||/mean||w_i-w_j||   "
           f"{out['mean_frac']:.3f}   (i.i.d. spread at N={N} would be "
           f"{((N-1)/N/2)**0.5:.3f})")
     if out["between_over_within"]:
         print(f"  between/within (weights)  {out['between_over_within']:.3f}"
               f"    within {out['within_group_mean']:.2f}  between {out['between_group_mean']:.2f}")
+        print(f"      over {out['n_multi_member_groups']} multi-member groups "
+              f"({out['n_within_pairs']} within / {out['n_between_pairs']} between "
+              f"pairs). Unique-pi singletons are excluded by construction, so "
+              f"this stays comparable across N.")
+    else:
+        print(f"  between/within (weights)  undefined -- "
+              f"{out['n_multi_member_groups']} multi-member group(s). An "
+              f"all-singleton probe has no within-group pair.")
     print("=" * 70)
 
     dest = args.json_out or os.path.join(args.zoo_dir, "zoo_geometry.json")
