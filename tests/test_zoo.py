@@ -304,6 +304,103 @@ def test_zoo_roundtrip():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_retry_classification():
+    """
+    open_domain_stream must retry a rate limit and NOT retry a dead id.
+
+    The first singleton-bearing job this repo ran died on a real HF 429
+    (2026-09-08). The beta calibration could not have found it: a one-hot anchor
+    takes mixture_stream's len(streams)==1 fast path, so Phase 1's jobs resolved
+    ONE dataset each while every singleton resolves five.
+
+    The negative cases are the point. Retrying a renamed-or-gated dataset id six
+    times and then reporting a rate limit would hide the single most fragile
+    thing in this repo, and would invite the corpus edit RESEARCH_PLAN §6.3
+    forbids -- which silently invalidates the beta calibration.
+    """
+    section("retry classification (mixtures.open_domain_stream)")
+    from llmzoo.data.mixtures import _is_retryable, open_domain_stream
+
+    # verbatim text of the failure on 2026-09-08
+    real429 = Exception(
+        "429 Client Error: Too Many Requests for url: "
+        "https://huggingface.co/api/datasets/manu/project_gutenberg/revision/"
+        "164853d2 (Request ID: Root=1-6aa0bb15) We had to rate limit your IP "
+        "(192.69.103.196). To continue using our service, create a HF account")
+    for exc, want, label in (
+        (real429,                                  True,  "real 429"),
+        (TimeoutError("connection timed out"),     True,  "timeout"),
+        (Exception("503 Service Unavailable"),     True,  "5xx"),
+        (KeyError("text_column 'text' not in"),    False, "schema break"),
+        (FileNotFoundError("dataset not found"),   False, "dead dataset id"),
+        (ValueError("mixture is all zeros"),       False, "own validation"),
+    ):
+        check(f"retryable({label}) == {want}", _is_retryable(exc) is want,
+              f"got {_is_retryable(exc)}")
+
+    # And the loop itself: a transient failure must be survived, a permanent one
+    # must surface on the FIRST attempt rather than after six sleeps.
+    import llmzoo.data.mixtures as mx
+    calls = {"n": 0}
+
+    class _FakeDatasets:
+        @staticmethod
+        def load_dataset(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise real429
+            return "STREAM"
+
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) \
+        else __builtins__.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "datasets":
+            return _FakeDatasets
+        return real_import(name, *a, **k)
+
+    if isinstance(__builtins__, dict):
+        __builtins__["__import__"] = fake_import
+    else:
+        __builtins__.__import__ = fake_import
+    try:
+        got = open_domain_stream("web", base_delay=0.001, log=lambda *_a: None)
+        check("transient 429 survived after retries",
+              got[0] == "STREAM" and got[1] == "text" and calls["n"] == 3,
+              f"got {got!r} after {calls['n']} calls")
+
+        calls["n"] = 0
+
+        class _DeadId:
+            @staticmethod
+            def load_dataset(*_a, **_k):
+                calls["n"] += 1
+                raise FileNotFoundError("Dataset 'foo/bar' doesn't exist")
+
+        def fake_import2(name, *a, **k):
+            if name == "datasets":
+                return _DeadId
+            return real_import(name, *a, **k)
+
+        if isinstance(__builtins__, dict):
+            __builtins__["__import__"] = fake_import2
+        else:
+            __builtins__.__import__ = fake_import2
+        raised = False
+        try:
+            open_domain_stream("web", base_delay=0.001, log=lambda *_a: None)
+        except FileNotFoundError:
+            raised = True
+        check("dead dataset id raises immediately, no retry loop",
+              raised and calls["n"] == 1,
+              f"raised={raised} after {calls['n']} calls")
+    finally:
+        if isinstance(__builtins__, dict):
+            __builtins__["__import__"] = real_import
+        else:
+            __builtins__.__import__ = real_import
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tiny", action="store_true")
@@ -317,6 +414,7 @@ def main():
     test_gpt2_configs()
     test_load_model_refuses_zoo_archs()
     test_mixtures()
+    test_retry_classification()
     test_source_abstraction(a.tiny)
     test_noise_source_fingerprint_unchanged()
     test_zoo_roundtrip()

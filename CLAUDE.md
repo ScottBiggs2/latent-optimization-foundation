@@ -164,5 +164,54 @@ until 2026-09-08, which meant registering an architecture silently reshaped ever
 `nn.Embedding` and invalidated every checkpoint. Use `N_COND_SLOTS` (fixed at 32).
 `N_ARCHS` is the registry size and is informational.
 
+**A SINGLETON mixture opens five HF streams; an ANCHOR opens one.** (2026-09-08)
+`mixture_stream` takes a `len(streams) == 1` fast path for a one-hot mixture, so all
+39 Phase 1 jobs resolved exactly one dataset each. Every singleton resolves five, and
+a 32-wide array makes ~160 near-simultaneous calls from one cluster IP — which drew
+`429 Too Many Requests ... We had to rate limit your IP` on the very first
+singleton-bearing job. Two fixes are in place and both matter: `HF_TOKEN` now reaches
+jobs via `~/.config/llmzoo/env` (it was already at `~/.cache/huggingface/token`, but
+`HF_HOME=/scratch/$USER` redirects the lookup away from it), and every zoo dataset
+open goes through `mixtures.open_domain_stream`, which backs off with full jitter.
+The token changes only the auth header — **it is not licence to switch to a gated
+corpus** (§6.3). `_is_retryable` deliberately does *not* match a dead dataset id or a
+schema break: retrying those and reporting a rate limit would hide the most fragile
+thing in this repo.
+
+**Run `--verify_mixture` before any singleton zoo, not just `--verify_domains`.**
+The interleave path is unreachable from an all-anchor zoo (any N≤20), so it is the
+only cheap proof. Seconds on `cpu`; ~4 min because the shuffle buffers fill.
+
+**Quote the BLOCK-ONLY spectrum beside the whole-stack one, always.**
+(`scripts/diag_block_spectrum.py`, 2026-09-08) §4.5 flagged the embedding-share
+confound as a thing to declare; measured, it is *dominant*. At Mini the embedding
+block is **51.0% of `D` but carries 87.5% of the centred variance**, so the
+whole-stack `effective_rank_ratio` (0.145) is essentially the embeddings' number
+(0.136) while the transformer blocks sit at **0.211**. The whole-stack figure is
+below §4.4's 0.2–0.3 prediction and the block figure is inside it. The script needs
+no PCA, no GPU and no torch — a Gram is a sum over coordinates, so
+`C_whole = C_extra + C_block` exactly.
+
+**`launch_beta_arm.sh` keys `ZOO_ROOT` and `--run_name` on (β, arch, N), not β.**
+Both were β-only and neither could fail at N=12. Pointed at the old default, Phase 2
+Mini would land in the N=12 calibration's directory and `train_zoo.py:621` would
+refuse every branch; and since every N=100 scale has k=99, all three scales wrote
+`runs/zoo_b030_k99` and the later fits overwrote the earlier ones. `THROTTLE` now
+defaults to 32 — it was 10, which is 10 waves instead of 4 and 71 h instead of 28 at
+Medium.
+
+**Anchor repo-root `.gitignore` patterns with a leading slash too**, not just rsync
+excludes. Unanchored `artifacts*/` matched at any depth and shadowed
+`src/llmzoo/artifacts/`, which is how that package's `__init__.py` sat **untracked**
+— the only subpackage missing its marker.
+
+**Attention is `sdpa` at all three scales**, resolved by HF at model init even though
+`zoo_config()` never sets `attn_implementation` (measured 2026-09-08, transformers
+4.57.6). So eager attention is *not* the explanation for Medium's low MFU. The LM
+head's share of `6·D` equals the embedding fraction exactly — 50.0% / 31.0% / 14.5%
+— so a cross-entropy fix is worth ~2× at Mini and little at Medium, which is 81% of
+Phase 2's bill. Throughput work is deliberately **not** being done: GPT-2 stays
+stock.
+
 **Zoo runs use `exclude_1d=False`.** GPT-2 has biases on every projection; with
 `True` a generated model would inherit member 0's. Costs ~0.1% of `D`.
