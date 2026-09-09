@@ -33,7 +33,7 @@ from llmzoo.artifacts.io import (
     ensemble_fingerprint, pca_fingerprint, provenance_block, read_json,
 )
 from llmzoo.data.ensemble import ENSEMBLE_SOURCES, EnsembleDataset
-from llmzoo.pca.gram import DualGramPCA
+from llmzoo.pca.gram import DualGramPCA, spectrum_stats
 from llmzoo.models.registry import N_FAMILIES
 from llmzoo.artifacts.bundle import CodeStats, rebuild_manifest
 from llmzoo.gen.vae import BetaScheduler, StackVAE
@@ -48,41 +48,6 @@ def ts() -> str:
 # Stages
 # ---------------------------------------------------------------------------
 
-def spectrum_stats(evals: np.ndarray, k: int) -> dict:
-    """
-    Flatness of the retained spectrum, measured three ways.
-
-    `ev0_over_evlast` is the ratio this repo reported first, and on its own it
-    MISLEADS at k = N-1. Measured on a pure-noise ensemble (N=12): 12.09 at k=N-1 but
-    1.006 at k=N/2, for the same data. At the rank bound `ev[k-1]` is the smallest
-    numerically-marginal direction left standing after the rank floor, so the ratio
-    describes the tail rather than the bulk and reads "steep" for an ensemble that is
-    flat by construction. Same trap as `total_variance_captured` being vacuous at
-    k = N-1 (misstep 15).
-
-    So two bulk statistics are recorded alongside it, and they are what anything
-    downstream should gate on:
-
-    ev0_over_median
-        The leading direction's variance as a multiple of the TYPICAL direction's.
-        ~1 for isotropic noise, large when a few directions carry the energy.
-
-    effective_rank_ratio
-        (sum ev)^2 / (sum ev^2) / k -- the participation ratio, normalised to [0, 1].
-        1.0 means every retained direction carries equal variance (perfectly flat);
-        small means the variance is concentrated. Unlike any ratio of two individual
-        eigenvalues, this cannot be moved by one marginal direction at the tail.
-    """
-    ev = np.asarray(evals, dtype=np.float64)[:max(int(k), 1)]
-    ev = np.clip(ev, 1e-300, None)
-    med = float(np.median(ev))
-    eff = float((ev.sum() ** 2) / max(float((ev ** 2).sum()), 1e-300))
-    return {
-        "ev0_over_evlast": float(ev[0] / ev[-1]),
-        "ev0_over_median": float(ev[0] / max(med, 1e-300)),
-        "effective_rank_ratio": eff / max(len(ev), 1),
-        "effective_rank": eff,
-    }
 
 
 def stage_pca(args, ds: EnsembleDataset, pca_root: str) -> Dict[str, DualGramPCA]:

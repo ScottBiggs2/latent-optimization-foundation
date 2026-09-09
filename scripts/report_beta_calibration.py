@@ -57,9 +57,25 @@ def fmt(x, spec="8.3f", none="    --"):
     return none if x is None else format(x, spec)
 
 
-def collect(artifact_dir: str, arch: str, beta: float, k: int) -> dict:
+def collect(artifact_dir: str, arch: str, beta: float, k: int,
+            zoo_name_tmpl: str = "zoo_{tag}",
+            run_name_tmpl: str = "zoo_{tag}_k{k}") -> dict:
+    """
+    Gather one beta arm's artifacts.
+
+    The two templates exist because Phase 2 does not use Phase 1's directory
+    layout. Phase 1 wrote `zoo_b030/<arch>` and `runs/zoo_b030_k11`; Phase 2 keys
+    both on (beta, arch, N) because every N=100 scale has k=99 and would
+    otherwise collide -- see slurm/launch_beta_arm.sh. Defaults reproduce the
+    Phase 1 paths exactly, so the calibration table still renders unchanged.
+
+    Available substitutions: {tag} {arch} {slug} {k} {beta}, where slug is the
+    arch with its `gpt2_zoo_` prefix removed.
+    """
     tag = tag_for(beta)
-    zoo = os.path.join(artifact_dir, f"zoo_{tag}", arch)
+    sub = {"tag": tag, "arch": arch, "slug": arch.replace("gpt2_zoo_", ""),
+           "k": k, "beta": beta}
+    zoo = os.path.join(artifact_dir, zoo_name_tmpl.format(**sub), arch)
     out = {"beta": beta, "tag": tag, "zoo_dir": zoo}
 
     out["n_members"] = len(glob.glob(os.path.join(zoo, "w_*.npy")))
@@ -73,8 +89,10 @@ def collect(artifact_dir: str, arch: str, beta: float, k: int) -> dict:
             members.append(m)
     out["members"] = members
 
+    run = run_name_tmpl.format(**sub)
     summary = read_json(os.path.join(
-        artifact_dir, "runs", f"zoo_{tag}_k{k}", f"pipeline_summary_k{k}.json"))
+        artifact_dir, "runs", run, f"pipeline_summary_k{k}.json"))
+    out["run_name"] = run
     out["spectrum"] = (summary or {}).get("per_arch", {}).get(arch)
     out["ensemble_fingerprint"] = (summary or {}).get("ensemble_fingerprint")
     return out
@@ -116,13 +134,23 @@ def main() -> int:
     p.add_argument("--betas", type=float, nargs="+",
                    default=[0.15, 0.30, 0.60])
     p.add_argument("--k", type=int, default=11)
+    p.add_argument("--n_expected", type=int, default=12,
+                   help="members a complete arm should have; only affects the "
+                        "'members' column's denominator")
+    p.add_argument("--zoo_name_tmpl", default="zoo_{tag}",
+                   help="Phase 2 uses zoo_{tag}_{slug}_n<N>. Substitutions: "
+                        "{tag} {arch} {slug} {k} {beta}")
+    p.add_argument("--run_name_tmpl", default="zoo_{tag}_k{k}",
+                   help="Phase 2 uses zoo_{tag}_{slug}_k{k}")
     p.add_argument("--show-tail-ratio", action="store_true",
                    help="also print ev[0]/ev[k-1], which is NOT a flatness "
                         "measure at the rank bound (misstep 15b)")
     p.add_argument("--json_out", default=None)
     args = p.parse_args()
 
-    arms = [collect(args.artifact_dir, args.arch, b, args.k) for b in args.betas]
+    arms = [collect(args.artifact_dir, args.arch, b, args.k,
+                    args.zoo_name_tmpl, args.run_name_tmpl)
+            for b in args.betas]
 
     print("=" * 78)
     print(f"beta calibration -- RESEARCH_PLAN §4.2 / §4.3   arch={args.arch} "
@@ -135,7 +163,7 @@ def main() -> int:
     print(f"  {'beta':>5} {'members':>8} {'gate':>6} {'spectrum':>9} "
           f"{'ens fingerprint':>17}")
     for a in arms:
-        print(f"  {a['beta']:5.2f} {a['n_members']:6d}/12 "
+        print(f"  {a['beta']:5.2f} {a['n_members']:6d}/{args.n_expected} "
               f"{'yes' if a['gate'] else 'MISSING':>6} "
               f"{'yes' if a['spectrum'] else 'MISSING':>9} "
               f"{str(a['ensemble_fingerprint'] or '--'):>17}")
@@ -259,7 +287,8 @@ def main() -> int:
         print("INCOMPLETE -- these arms produced no verdict, which is NOT a gate "
               "failure:")
         for a in incomplete:
-            print(f"    beta={a['beta']:.2f}  members={a['n_members']}/12  "
+            print(f"    beta={a['beta']:.2f}  members={a['n_members']}/"
+                  f"{args.n_expected}  "
                   f"gate={'present' if a['gate'] else 'absent'}")
         print("  Finish or re-run these before drawing any conclusion. Resubmitting")
         print("  a branch array is safe: a member whose w_<i>.npy exists exits")
