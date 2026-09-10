@@ -191,6 +191,47 @@ def train(args) -> None:
               "       the prior. Compare flow_codes against gauss_codes, NOT\n"
               "       against pca_only, when reading the eval table.")
 
+    # --- the retrieval-difficulty knob -------------------------------------
+    # Drop every training row whose mixture sits within L1 `--exclude_within_l1` of
+    # `--center_pi`, so the nearest mixture the flow ever saw is pushed away from the
+    # target on purpose.
+    #
+    # This exists because §6.4's sealed interior holdout is SATURATED: holdout_split
+    # picks the four singletons nearest the barycentre, the densest part of the
+    # simplex, so the nearest trained neighbour already matches the model trained at
+    # that mixture to within the noise floor and no generative claim is available
+    # there. Sweeping the radius turns one saturated number into a curve, with
+    # retrieval difficulty as the x-axis.
+    #
+    # The BASIS is deliberately left alone -- only the flow's training rows are
+    # subsetted -- so the sweep varies one thing and k stays fixed across it.
+    excluded_rows: list = []
+    keep = torch.ones(x1_all.shape[0], dtype=torch.bool, device=device)
+    if args.exclude_within_l1 is not None:
+        if pi_all is None:
+            raise SystemExit("--exclude_within_l1 needs --cond_mode pi.")
+        if args.center_pi is None:
+            raise SystemExit("--exclude_within_l1 needs --center_pi.")
+        c = torch.tensor(args.center_pi, dtype=torch.float32,
+                         device=device).reshape(1, -1)
+        if c.shape[1] != pi_all.shape[1]:
+            raise SystemExit(
+                f"--center_pi has {c.shape[1]} weights but pi has "
+                f"{pi_all.shape[1]} domains.")
+        d1 = (pi_all - c).abs().sum(dim=1)
+        keep = d1 > float(args.exclude_within_l1)
+        excluded_rows = torch.nonzero(~keep, as_tuple=True)[0].cpu().tolist()
+        if int(keep.sum()) < 3:
+            raise SystemExit(
+                f"--exclude_within_l1 {args.exclude_within_l1} leaves "
+                f"{int(keep.sum())} rows, too few to fit anything.")
+        nearest = float(d1[keep].min())
+        print(f"  radius     : excluded {len(excluded_rows)} rows within L1 "
+              f"{args.exclude_within_l1} of the target; {int(keep.sum())} remain, "
+              f"nearest surviving mixture at L1 {nearest:.3f}")
+        x1_all, fidx, codes = x1_all[keep], fidx[keep], codes[keep]
+        pi_all = pi_all[keep]
+
     # --- optional held-out rows -------------------------------------------
     # Held out PER FAMILY, not uniformly at random: a random split can starve a
     # whole family, and the conditioning would then be evaluated on a label the
@@ -483,6 +524,10 @@ def train(args) -> None:
                     "code_rms_ratio_at_fixed_pi": final_rms_at_pi,
                     "n_anchor_rows": (len(anchor_rows) if anchor_rows else 0),
                     "pi_code_distance_corr": pi_corr,
+                    "exclude_within_l1": args.exclude_within_l1,
+                    "center_pi": args.center_pi,
+                    "n_excluded_rows": len(excluded_rows),
+                    "excluded_rows": excluded_rows,
                     "gated_on": "val_loss" if x_va.shape[0] > 0 else "train_loss",
                     "round_trip": diag,
                     "spectrum": spectrum,
@@ -535,6 +580,15 @@ def main() -> None:
     p.add_argument("--hidden_dims", nargs="+", type=int, default=[256, 512, 256])
     p.add_argument("--time_embed_dim", type=int, default=64)
     p.add_argument("--cond_dim", type=int, default=64)
+    p.add_argument("--exclude_within_l1", type=float, default=None,
+                   help="Drop every training row whose mixture is within this L1 "
+                        "distance of --center_pi. The retrieval-difficulty knob: "
+                        "§6.4's sealed interior holdout is saturated, so a sweep "
+                        "over this radius is what turns retrieval into an x-axis. "
+                        "Leaves the PCA basis untouched, so k is fixed across the "
+                        "sweep.")
+    p.add_argument("--center_pi", type=float, nargs="+", default=None,
+                   help="The target mixture the radius is measured from.")
     p.add_argument("--cond_mode", choices=["family", "pi"], default="family",
                    help="What the velocity field is conditioned on. 'family' "
                         "is an nn.Embedding row per architecture -- which in a "

@@ -69,11 +69,38 @@ one anchor's samples to that anchor's own within-group spread. Only the second c
 memorisation-as-point-mass, which is π-conditioning's own failure mode — π is nearly a
 unique key here, 85 distinct mixtures over 100 members with each singleton seen once.
 
-**Measured at Mini, all 8 π cells: conditioning is INERT at k=N−1.** With
-`C = (R−at_pi)/(R−1)`, R = 3.07 (π ignored) and 1.0 (fully conditional): C = −0.03…+0.02
-at k=99/91, and +0.12…+0.20 at k=50/46. The pooled ratio reads a healthy 0.85–1.10 in
-**every** cell, so this is invisible without the conditional statistic. Halving k is
-worth ~10× on conditioning strength.
+**Quote `recovery`, not the raw `at_pi`.** `at_pi`'s denominator moves with k —
+`within/pooled` is 0.320 at k=99 but 0.022 at k=10 — so a raw `at_pi` of 23 at low
+rank is a shrinking denominator, not a broken flow. Convert by the law of total
+variance: `recovery = [1 − (at_pi·within/pooled)²] / [1 − (within/pooled)²]`, i.e. the
+share of the conditional structure the DATA contains at that rank that the flow
+actually reproduces. 0% = π ignored, 100% = fully recovered.
+
+**The flow was UNDERFIT, not under-expressive, and 500 epochs is the cause.**
+(2026-09-09, 12 cells, `runs/zoo_b015_mini_k99/diag_cond/`) 85 rows at batch 64 is ~2
+batches/epoch, so the committed default is **~1000 optimiser steps**; DeepWeightFlow ran
+30k. At k=50: recovery 27.6% (500 ep) → 45.2% (2000) → **90.2% (8000)**, and 75.3% from
+width alone at 500. k=99 looks hopeless at 1.8% but reaches **74.6%** with
+(256,512,256) at 8000 — so **rank is a convergence-rate axis, not a structural one.**
+The π-MLP was never the constraint: 2 layers on a 5-dim input, modelling ~4 dimensions.
+
+**misstep 21 does not transfer to a real zoo as written — but its mechanism does, in a
+different statistic.** Its table was measured by `diag_flow_capacity.py` on the
+MANUFACTURED NOISE ensemble (`ev0/median = 1.001`), where nothing could be learned and
+capacity could only memorise. On this zoo (`ev0/median = 309`) the forbidden treatments
+*raise* pooled rms to 1.08–1.16. But at 20000 epochs `at_pi` falls to **0.955 — below
+1**, the conditional distribution now tighter than real within-mixture variation, while
+pooled sits at a healthy 1.081 and sees nothing:
+
+> noise ensemble → over-fitting collapses the **marginal**; pooled rms catches it.
+> real zoo → over-fitting over-tightens the **conditional**; only `at_pi` catches it.
+
+Working range is ~8000 epochs. Re-measure per scale; do not assume it transfers.
+
+**No dispersion statistic can prove generalisation.** `at_pi ≈ 1` is equally consistent
+with learning `p(code|π)` and with memorising the four anchor members at that π — a
+mixture of four memorised deltas has exactly the right conditional spread. Only a
+held-out π against §6.4's retrieval baseline separates them.
 
 **Verify the π↔code row pairing, or a scrambled join reads as a null result.**
 `train_flow.py` seals `pi_code_distance_corr` — the correlation of pairwise L1 in

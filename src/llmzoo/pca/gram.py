@@ -308,6 +308,52 @@ class DualGramPCA:
             torch.cuda.empty_cache()
         return out
 
+    def inverse_transform_many(
+        self,
+        Z: np.ndarray,
+        dataset,
+        arch: Optional[str] = None,
+        k: Optional[int] = None,
+        out: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Reconstruct a WHOLE COHORT of codes (n, k) -> (n, D) in ONE streaming pass.
+
+        Identical arithmetic to inverse_transform, with `a` promoted from (N,) to
+        (n, N) so the per-chunk contraction becomes a matmul instead of a matvec.
+
+        This is not a micro-optimisation. inverse_transform walks every member of the
+        ensemble for every code it decodes -- at Mini that is 100 x 206 MB = 20.6 GB
+        of reads PER GENERATED MODEL. A retrieval sweep decoding a few dozen models
+        would move terabytes and look hung rather than failed. Batched, the whole
+        cohort costs one pass, and the extra memory is only n x D x 4 bytes for the
+        output plus one chunk of working set.
+
+        Cap `n` by the caller's memory budget: at Mini, 32 rows of D=51.5M is 6.6 GB.
+        """
+        arch = arch or self.arch
+        Z = np.atleast_2d(np.asarray(Z))
+        A = np.stack([self.weights_for_code(z, k=k) for z in Z])   # (n, N)
+        a_sum = A.sum(axis=1)                                      # (n,)
+        dev = torch.device(self.device)
+        A_t = torch.from_numpy(A).to(dev, dtype=torch.float32)
+        s_t = torch.from_numpy(1.0 - a_sum).to(dev, dtype=torch.float32).reshape(-1, 1)
+
+        n, D = A.shape[0], self.n_params_
+        if out is None:
+            out = np.empty((n, D), dtype=np.float32)
+        w0_mm = dataset.w0(arch)
+
+        for ci, (r0, r1) in enumerate(dataset.chunk_bounds(arch)):
+            B = dataset.load_chunk(arch, ci, device=dev, w0_mm=w0_mm)   # (N, chunk)
+            m = torch.from_numpy(np.array(self.mean_[r0:r1])).to(dev)   # (chunk,)
+            chunk = s_t * m.reshape(1, -1) + (A_t @ B)                  # (n, chunk)
+            out[:, r0:r1] = chunk.float().cpu().numpy()
+            del B, m, chunk
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        return out
+
     def transform_vector(
         self,
         x: np.ndarray,
