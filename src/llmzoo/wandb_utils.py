@@ -117,9 +117,19 @@ def init_run(
     os.environ.setdefault("WANDB_DIR", scratch)
 
     job_id = os.environ.get("SLURM_JOB_ID", "local")
-    name = f"{job_type}_{job_id}"
-    if name_suffix:
-        name = f"{name}_{name_suffix}"
+    # THE DESCRIPTIVE PART GOES FIRST, THE JOB ID LAST.
+    #
+    # The runs table sorts by name, and with the job id leading, a 100-way branch
+    # array sorts by submission order -- which is close to random with respect to
+    # the experiment, and puts Mini, Small and Medium runs interleaved. Leading
+    # with the suffix makes `small_b015_member042` sit beside
+    # `small_b015_member043`, and a whole scale sit together. That is the only
+    # thing that makes a three-scale ladder scannable without opening runs.
+    #
+    # Historical runs keep the names they were created with; this only affects
+    # runs created from here on.
+    name = (f"{job_type}_{name_suffix}_{job_id}" if name_suffix
+            else f"{job_type}_{job_id}")
     _wandb.init(
         entity=ENTITY,
         project=resolve_project(project),
@@ -148,6 +158,23 @@ def summary(data: dict) -> None:
     """
     if _wandb is not None and _wandb.run is not None:
         _wandb.run.summary.update(data)
+
+
+def run_id() -> Optional[str]:
+    """
+    The active run's W&B id, or None.
+
+    Exists so a checkpointed job can seal the id of the run that wrote the
+    checkpoint, and the resumed job can seal the ids that preceded it -- which
+    makes a member that spans several Slurm jobs walkable in both directions
+    instead of appearing as unrelated duplicates in the same group.
+
+    No-ops to None exactly like log() and summary(), so callers never have to
+    know whether W&B is active.
+    """
+    if _wandb is not None and _wandb.run is not None:
+        return _wandb.run.id
+    return None
 
 
 def finish() -> None:

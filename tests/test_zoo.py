@@ -15,6 +15,7 @@ pre-refactor ensemble, because every existing artifact is keyed on that.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -401,6 +402,334 @@ def test_retry_classification():
             __builtins__.__import__ = real_import
 
 
+
+# ---------------------------------------------------------------------------
+# Mid-run checkpoint / resume  (scripts/train_zoo.py)
+# ---------------------------------------------------------------------------
+#
+# Runs on the `cpu` partition with NO GPU and NO corpus download. Two facts make
+# that possible: train_zoo.py's `from transformers import AutoTokenizer` is inside
+# main(), so importing the module touches no network; and mixture_stream is
+# monkeypatched here with a seeded fake, so tokenizer=None is never dereferenced.
+
+def _tz():
+    """Import scripts/train_zoo.py as a module, the way tests/test_report.py does."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    scripts = os.path.join(here, os.pardir, "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import train_zoo
+    return train_zoo
+
+
+class _FakeLM:
+    """Stands in for GPT2LMHeadModel: returns .logits from an nn.Embedding(V, V)."""
+
+    def __init__(self, V=64, seed=0):
+        import torch
+        import torch.nn as nn
+        g = torch.Generator().manual_seed(seed)
+        self.V = V
+        self.emb = nn.Embedding(V, V)
+        with torch.no_grad():
+            self.emb.weight.copy_(torch.randn(V, V, generator=g) * 0.02)
+
+    def __call__(self, input_ids=None, labels=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(logits=self.emb(input_ids))
+
+    def parameters(self):
+        return self.emb.parameters()
+
+    def train(self):
+        return self
+
+    def state_dict(self):
+        return self.emb.state_dict()
+
+    def load_state_dict(self, sd):
+        return self.emb.load_state_dict(sd)
+
+
+# Absolute position in the fake corpus, controlled by the tests rather than by the
+# generator, so a resumed span can be placed exactly where the killed one stopped.
+_FAKE_POS = [0]
+
+
+def _fake_stream_factory(V=64):
+    """
+    A deterministic corpus indexed by ABSOLUTE POSITION, not by seed.
+
+    The resume test drives _FAKE_POS by hand so the resumed segment reads the very
+    documents the killed segment would have read next. That is deliberately NOT what
+    the real path does -- HF streaming cannot be fast-forwarded cheaply, so a real
+    resume re-seeds at base_seed + SEGMENT_SEED_STRIDE * segment and re-reads some
+    documents (which is why data_seeds and resume_steps are sealed per member). The
+    point of pinning the data here is to isolate the model / optimizer / LR-schedule
+    arithmetic, so that a failure means the resume machinery is wrong rather than
+    merely that the corpus moved.
+
+    batches() pulls exactly batch_size items per step with no prefetch, so after
+    `n` steps the position is n * batch_size * grad_accum.
+    """
+    import torch
+
+    def fake(pi, tokenizer, n_ctx, seed):
+        while True:
+            i = _FAKE_POS[0]
+            _FAKE_POS[0] = i + 1
+            g = torch.Generator().manual_seed(1234 + i)
+            yield torch.randint(0, V, (n_ctx + 1,), generator=g)
+    return fake
+
+
+def _run_span(TZ, *, start_step, n_steps, total_steps, seed=7, ckpt_every=0,
+              save_ckpt=None, prior=None, model=None, opt=None, V=64,
+              lrs=None):
+    import torch
+    if model is None:
+        model = _FakeLM(V=V, seed=0)
+    if opt is None:
+        opt = torch.optim.AdamW(model.parameters(), lr=6e-4,
+                                betas=(0.9, 0.95), weight_decay=0.1)
+    if lrs is not None:
+        real_lr_at = TZ.lr_at
+
+        def spy(step, total, peak, warmup, **kw):
+            v = real_lr_at(step, total, peak, warmup, **kw)
+            lrs.append((step, v))
+            return v
+        TZ.lr_at = spy
+    try:
+        thr = TZ.train_span(
+            model, opt, np.full(5, 0.2), tokenizer=None,
+            device=torch.device("cpu"), n_ctx=15, batch_size=2, grad_accum=1,
+            start_step=start_step, n_steps=n_steps, total_steps=total_steps,
+            peak_lr=6e-4, warmup=2, seed=seed, log_every=5,
+            amp_dtype=torch.float32, ckpt_every=ckpt_every,
+            save_ckpt=save_ckpt, prior=prior)
+    finally:
+        if lrs is not None:
+            TZ.lr_at = real_lr_at
+    return model, opt, thr
+
+
+def test_ckpt_paths_and_refusals():
+    section("checkpoint: destination and key refusals")
+    TZ = _tz()
+
+    # -- the /work refusal, a pure string predicate: no cluster, no filesystem
+    art = "/work/neu/p2026_0038_neu/u/llm_vae"
+    check("ckpt_dir inside /work is refused",
+          TZ.refuse_ckpt_dir("/work/neu/p2026_0038_neu/u/ckpt", art) is not None)
+    check("ckpt_dir inside the artifact tree is refused",
+          TZ.refuse_ckpt_dir(art + "/ckpt", art) is not None)
+    check("ckpt_dir on /scratch is allowed",
+          TZ.refuse_ckpt_dir("/scratch/u/zoo_ckpt", art) is None)
+    check("default_ckpt_dir lives on /scratch",
+          TZ.default_ckpt_dir().startswith("/scratch/"))
+
+    # -- SEGMENT_SEED_STRIDE must exceed train_span's max_restarts, or a resumed
+    #    segment could re-read exactly the prefix a restart already read.
+    check("SEGMENT_SEED_STRIDE > max_restarts (8)", TZ.SEGMENT_SEED_STRIDE > 8,
+          f"stride={TZ.SEGMENT_SEED_STRIDE}")
+
+    d = tempfile.mkdtemp(prefix="zoockpt_")
+    try:
+        base = dict(arch="gpt2_zoo_small", beta=0.15, n_members=100,
+                    span="member_7", member_idx=7, total_steps=18988,
+                    trunk_steps=16140, branch_steps=2848, tokens_per_step=131072,
+                    n_ctx=1024, warmup=189, peak_lr=6e-4, base_seed=10007,
+                    zoo_dir=d, trunk_seed=1234, trunk_step=16140,
+                    device_name="NVIDIA B200")
+        key = TZ.ckpt_key(**base)
+        path = TZ.ckpt_path(d, "gpt2_zoo_small", 0.15, 100, "member_0007")
+        check("ckpt_path carries arch, beta and N in the directory",
+              "gpt2_zoo_small_b015_n100" in path and path.endswith("member_0007.pt"),
+              path)
+
+        # -- missing file is not an error and not a refusal
+        ck, why = TZ.load_ckpt(path, key)
+        check("a missing checkpoint is (None, []) not a refusal",
+              ck is None and why == [])
+
+        TZ.save_ckpt_atomic(path, {"format": TZ.ZOO_CKPT_VERSION, "key": key,
+                                   "step": 500, "acc": {"segments": 1}})
+        check("no .tmp survives an atomic write",
+              os.path.exists(path) and not glob.glob(path + ".tmp*"))
+
+        ck, why = TZ.load_ckpt(path, key)
+        check("a matching key resumes", ck is not None and ck["step"] == 500, str(why))
+
+        # -- every key field must refuse, and must NAME the field it refused on
+        for field, bad in [("arch", "gpt2_zoo_medium"), ("beta", 0.30),
+                           ("n_members", 60), ("member_idx", 8),
+                           ("total_steps", 54141), ("trunk_steps", 46020),
+                           ("device_name", "NVIDIA GeForce RTX 4090")]:
+            want = dict(key)
+            want[field] = bad
+            ck2, why2 = TZ.load_ckpt(path, want)
+            check(f"key mismatch on {field!r} is refused and named",
+                  ck2 is None and any(repr(field) in r for r in why2),
+                  f"{why2}")
+
+        # -- allow_device_change is expressed by dropping the field from the
+        #    comparison, so the rest of the key still has to match
+        want = {k: v for k, v in key.items() if k != "device_name"}
+        ck3, why3 = TZ.load_ckpt(path, want)
+        check("dropping device_name from the key permits a cross-device resume",
+              ck3 is not None, str(why3))
+
+        # -- a garbage FINAL file is a refusal, never a silent restart
+        with open(path, "wb") as f:
+            f.write(b"not a torch file")
+        ck4, why4 = TZ.load_ckpt(path, key)
+        check("an undeserializable checkpoint refuses rather than restarting",
+              ck4 is None and why4 and "will not deserialize" in why4[0], str(why4))
+
+        # -- a stale .tmp is invisible: the loader gates on the final name only
+        os.remove(path)
+        with open(path + ".tmp.somehost.999", "wb") as f:
+            f.write(b"truncated")
+        ck5, why5 = TZ.load_ckpt(path, key)
+        check("a leftover .tmp is never mistaken for a checkpoint",
+              ck5 is None and why5 == [])
+
+        # -- drop_ckpt sweeps the orphan tmp too, and tolerates a missing file
+        other = TZ.ckpt_path(d, "gpt2_zoo_small", 0.15, 100, "member_0008")
+        TZ.save_ckpt_atomic(other, {"format": TZ.ZOO_CKPT_VERSION, "key": key,
+                                    "step": 1, "acc": {}})
+        TZ.drop_ckpt(path)
+        check("drop_ckpt removes orphaned .tmp files",
+              not glob.glob(path + ".tmp*"))
+        check("drop_ckpt leaves a sibling member's checkpoint alone",
+              os.path.exists(other))
+        TZ.drop_ckpt(path)
+        check("drop_ckpt on a missing path does not raise", True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_ckpt_inert_when_off():
+    section("checkpoint: inert when --ckpt_every 0")
+    TZ = _tz()
+    import torch
+    TZ.mixture_stream = _fake_stream_factory()
+
+    d = tempfile.mkdtemp(prefix="zooinert_")
+    try:
+        _FAKE_POS[0] = 0
+        m1, o1, thr1 = _run_span(TZ, start_step=0, n_steps=8, total_steps=40,
+                                 ckpt_every=0, save_ckpt=None)
+        # save_ckpt is None, so nothing can be written even with a huge interval
+        _FAKE_POS[0] = 0
+        m2, o2, thr2 = _run_span(TZ, start_step=0, n_steps=8, total_steps=40,
+                                 ckpt_every=10 ** 9, save_ckpt=None)
+        check("no files are written when checkpointing is off",
+              os.listdir(d) == [], str(os.listdir(d)))
+        same = torch.equal(m1.state_dict()["weight"], m2.state_dict()["weight"])
+        check("ckpt_every=0 and ckpt_every=1e9 give bitwise-equal weights", same)
+
+        for k in ("tokens", "seconds", "steady_seconds", "startup_seconds",
+                  "tokens_per_sec", "tokens_per_sec_avg", "n_windows",
+                  "stream_restarts", "mfu", "peak_tflops", "final_loss"):
+            if k not in thr1:
+                check(f"legacy throughput key {k!r} survives", False)
+                break
+        else:
+            check("every legacy throughput key survives", True)
+        check("an un-resumed span reports segments=1, resumed=False",
+              thr1["segments"] == 1 and thr1["resumed"] is False,
+              f"{thr1['segments']} / {thr1['resumed']}")
+        check("an un-resumed span records no resume steps",
+              thr1["resume_steps"] == [] and len(thr1["data_seeds"]) == 1)
+        check("stream_restarts equals the sum of its per-segment list",
+              thr1["stream_restarts"] == sum(thr1["stream_restarts_per_segment"]))
+        check("startup_seconds equals the sum of its per-segment list",
+              abs(thr1["startup_seconds"]
+                  - sum(thr1["startup_seconds_per_segment"])) < 1e-6)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_ckpt_resume_arithmetic():
+    section("checkpoint: a resumed span equals an uninterrupted one")
+    TZ = _tz()
+    import torch
+    TZ.mixture_stream = _fake_stream_factory()
+
+    d = tempfile.mkdtemp(prefix="zooresume_")
+    try:
+        # -- Run A: 20 steps straight through, recording every LR
+        _FAKE_POS[0] = 0
+        lrs_a = []
+        mA, oA, thrA = _run_span(TZ, start_step=0, n_steps=20, total_steps=40,
+                                 lrs=lrs_a)
+
+        # -- Run B: 10 steps, checkpoint, restore into FRESH objects, 10 more
+        path = TZ.ckpt_path(d, "gpt2_zoo_small", 0.15, 100, "member_0000")
+        saved = {}
+
+        def save(next_step, acc, loss):
+            saved["step"], saved["acc"] = next_step, acc
+            TZ.save_ckpt_atomic(path, {"format": TZ.ZOO_CKPT_VERSION, "key": {},
+                                       "step": next_step, "acc": acc,
+                                       "model": mB.state_dict(),
+                                       "optimizer": oB.state_dict()})
+
+        _FAKE_POS[0] = 0
+        lrs_b = []
+        mB = _FakeLM(V=64, seed=0)
+        oB = torch.optim.AdamW(mB.parameters(), lr=6e-4, betas=(0.9, 0.95),
+                               weight_decay=0.1)
+        _run_span(TZ, start_step=0, n_steps=20, total_steps=40, ckpt_every=10,
+                  save_ckpt=save, model=mB, opt=oB, lrs=lrs_b)
+        check("a checkpoint was written at the interval",
+              saved.get("step") == 10, str(saved.get("step")))
+
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        mC = _FakeLM(V=64, seed=99)                 # deliberately a DIFFERENT init
+        oC = torch.optim.AdamW(mC.parameters(), lr=6e-4, betas=(0.9, 0.95),
+                               weight_decay=0.1)
+        mC.load_state_dict(ck["model"])
+        oC.load_state_dict(ck["optimizer"])
+        # Place the resumed segment where the killed one stopped: 10 steps at
+        # batch_size 2 and grad_accum 1 is 20 documents.
+        _FAKE_POS[0] = ck["step"] * 2
+        lrs_c = []
+        _, oC, thrC = _run_span(TZ, start_step=ck["step"], n_steps=10,
+                                total_steps=40, model=mC, opt=oC,
+                                prior=ck["acc"], lrs=lrs_c)
+
+        check("resumed weights are bitwise equal to the uninterrupted run",
+              torch.equal(mA.state_dict()["weight"], mC.state_dict()["weight"]))
+        stepA = int(list(oA.state.values())[0]["step"])
+        stepC = int(list(oC.state.values())[0]["step"])
+        check("Adam's own step counter reaches 20 in both", stepA == stepC == 20,
+              f"{stepA} vs {stepC}")
+
+        # THE load-bearing one. The trunk/branch design exists so the global cosine
+        # continues across the branch point rather than restarting; a resume must
+        # not reintroduce the transient that would cause.
+        tail = lrs_a[len(lrs_a) - len(lrs_c):]
+        check("the per-step LR sequence is identical across the resume",
+              lrs_c == tail, f"{lrs_c[:3]} vs {tail[:3]}")
+
+        check("segments accumulates to 2", thrC["segments"] == 2)
+        check("resumed is True after a resume", thrC["resumed"] is True)
+        check("the resume step is recorded", thrC["resume_steps"] == [10],
+              str(thrC["resume_steps"]))
+        check("both segments' data seeds are sealed",
+              len(thrC["data_seeds"]) == 2, str(thrC["data_seeds"]))
+        check("tokens accumulate across segments",
+              thrC["tokens"] == thrA["tokens"],
+              f"{thrC['tokens']} vs {thrA['tokens']}")
+        check("startup is summed over segments, not overwritten",
+              len(thrC["startup_seconds_per_segment"]) == 2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tiny", action="store_true")
@@ -418,6 +747,9 @@ def main():
     test_source_abstraction(a.tiny)
     test_noise_source_fingerprint_unchanged()
     test_zoo_roundtrip()
+    test_ckpt_paths_and_refusals()
+    test_ckpt_inert_when_off()
+    test_ckpt_resume_arithmetic()
 
     print("\n" + "=" * 72)
     print(f"{PASS} passed, {FAIL} failed")

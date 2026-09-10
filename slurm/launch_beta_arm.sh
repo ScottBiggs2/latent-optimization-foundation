@@ -61,6 +61,23 @@ BRANCH_TIME="${BRANCH_TIME:-01:00:00}"
 # NFS. The committed 1 h was sized for 12 x 206 MB = 2.5 GB; at N=100 Medium it
 # is 100 x 1.42 GB = 142 GB per pass.
 SPEC_TIME="${SPEC_TIME:-02:00:00}"
+# The gate's own sbatch header hardcodes 01:30:00 and nothing could override it, so
+# a scale whose 100 members take longer to score had no lever at all. It rebuilds
+# each member in place and runs 5 domains x 64 blocks of forwards, so it grows with
+# both D and N.
+GATE_TIME="${GATE_TIME:-01:30:00}"
+
+# Mid-run checkpointing for the trunk and the branches. 0 = OFF, which is the
+# default and is what Mini and Small run. Turn it on for spans long enough that
+# losing one hurts: Medium's trunk is ~16.5 h against a 24 h MaxTime.
+CKPT_EVERY="${CKPT_EVERY:-0}"
+
+# W&B project. One per WORKSTREAM, which is what aicr_env.sh:90-93 describes and
+# what no zoo sbatch ever actually set -- so every zoo run landed in the historical
+# `llm-vae` alongside the flow and eval runs. `llmzoo-genverify` is already the
+# generative-verification project; this is its zoo-training sibling.
+WANDB_PROJECT="${WANDB_PROJECT:-llmzoo-zoo}"
+export WANDB_PROJECT
 
 # Skip the trunk job when the trunk has already been staged into ZOO_ROOT (which
 # is valid: total_steps/trunk_steps depend on tokens_per_param, batch,
@@ -116,6 +133,13 @@ K=$((N_MEMBERS - 1))
 ARRAY="${ARRAY:-0-$LAST}"
 SLUG="${ARCH#gpt2_zoo_}"
 RUN_NAME="zoo_${TAG}_${SLUG}_k$K"
+# The W&B cell for this whole zoo. train_zoo.py and eval_domains.py each build this
+# same string internally, but train_stack.py has NO fallback -- it passes
+# `group=args.wandb_group` straight through, and this launcher never sent one. So the
+# spectrum run landed in `job_<jobid>` and sat OUTSIDE the row holding the trunk, the
+# 100 branches and the gate it belongs to. Must match train_zoo.py's group exactly,
+# including N.
+WB_GROUP="zoo_${ARCH}_${TAG}_n${N_MEMBERS}"
 WAVES=$(( (N_MEMBERS + THROTTLE - 1) / THROTTLE ))
 
 echo "=================================================================="
@@ -127,7 +151,20 @@ echo " walltimes     : trunk=$TRUNK_TIME  branch=$BRANCH_TIME  spec=$SPEC_TIME"
 echo " array         : $ARRAY   ($THROTTLE at a time -> ~$WAVES wave(s))"
 echo " skip trunk    : $SKIP_TRUNK"
 echo " exclude nodes : ${EXCLUDE_NODES:-<none>}"
+echo " checkpointing : CKPT_EVERY=$CKPT_EVERY$([ "$CKPT_EVERY" = "0" ] && echo '  (OFF)')"
+echo " wandb         : project=$WANDB_PROJECT"
+echo "                 group=$WB_GROUP"
 echo "=================================================================="
+
+# A long span with no checkpointing is the expensive mistake this warns about.
+# Keyed on the actual walltimes rather than on the arch string, so it fires for any
+# configuration that has grown long enough to matter.
+if [ "$CKPT_EVERY" = "0" ] \
+   && { [ "${TRUNK_TIME%%:*}" -ge 8 ] || [ "${BRANCH_TIME%%:*}" -ge 8 ]; }; then
+  echo "WARNING: CKPT_EVERY=0 with TRUNK_TIME=$TRUNK_TIME BRANCH_TIME=$BRANCH_TIME." >&2
+  echo "         A walltime kill or a bad node loses the WHOLE span -- there is no" >&2
+  echo "         resume below whole-member granularity. Suggest CKPT_EVERY=1000." >&2
+fi
 
 cd "$CODE_DIR"
 
@@ -172,7 +209,7 @@ if [ "$SKIP_TRUNK" = "1" ]; then
   echo "trunk      : SKIPPED (staged trunk.pt + zoo_plan.json already present)"
 else
   t=$(ZOO_ROOT="$ZOO_ROOT" ARCH="$ARCH" BETA="$BETA" N_MEMBERS="$N_MEMBERS" \
-      EXTRA="$EXTRA" \
+      EXTRA="$EXTRA" CKPT_EVERY="$CKPT_EVERY" \
       sbatch --parsable --partition="$PARTITION" --time="$TRUNK_TIME" \
              --job-name="trunk_$TAG" "${EXC[@]}" \
              slurm/zoo_trunk.sbatch)
@@ -186,7 +223,7 @@ fi
 DEP=()
 [ -n "$t" ] && DEP=(--dependency="afterok:$t")
 b=$(ZOO_ROOT="$ZOO_ROOT" ARCH="$ARCH" BETA="$BETA" N_MEMBERS="$N_MEMBERS" \
-    EXTRA="$EXTRA" \
+    EXTRA="$EXTRA" CKPT_EVERY="$CKPT_EVERY" \
     sbatch --parsable --partition="$PARTITION" --time="$BRANCH_TIME" \
            --job-name="branch_$TAG" \
            --array="$ARRAY%$THROTTLE" "${DEP[@]}" "${EXC[@]}" \
@@ -197,7 +234,7 @@ echo "branches   : $b  (array $ARRAY%$THROTTLE, ~$WAVES wave(s))"
 # the b200 ceiling and runs alongside the next beta's training.
 g=$(ZOO_ROOT="$ZOO_ROOT" ARCH="$ARCH" EXTRA="$GATE_EXTRA" \
     sbatch --parsable --job-name="gate_$TAG" --dependency="afterok:$b" \
-           "${EXC[@]}" \
+           --time="$GATE_TIME" "${EXC[@]}" \
            slurm/eval_domains.sbatch)
 echo "gate       : $g  (rtx-batch, exit 1 = gate fired)"
 
@@ -221,6 +258,7 @@ s=$(sbatch --parsable --job-name="spec_$TAG" --dependency="afterok:$b" \
                    python -u scripts/train_stack.py \
                      --arch_list $ARCH --mode full \
                      --run_name $RUN_NAME --artifact_dir \$ARTIFACT_DIR \
+                     --wandb_group $WB_GROUP --wandb_project $WANDB_PROJECT \
                      --source zoo --zoo_dir '$ZOO_ROOT' \
                      --n_samples $N_MEMBERS --k $K \
                      --noise_scale 0.0 --no_exclude_1d \

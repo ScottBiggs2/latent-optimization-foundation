@@ -54,6 +54,8 @@ slurm_*.out
 slurm_*.err
 *.out
 *.err
+*.tex
+
 
 # Claude Code local state — machine-specific, and a stale scheduler lock lived
 # here dirtying `git status` for two months.
@@ -91,6 +93,9 @@ wandb/
 # with no secrets in it, and it is the record of which versions produced a
 # result. Keep it tracked.
 !slurm/env_lock_aicr.txt
+
+reports/*
+reports
 
 # Figure renders are regenerable from reports/*.py; don't commit 500 KB PNGs.
 reports/*.png

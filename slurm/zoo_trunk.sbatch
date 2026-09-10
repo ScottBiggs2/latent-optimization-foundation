@@ -57,6 +57,23 @@ ARCH="${ARCH:-gpt2_zoo_mini}"
 BETA="${BETA:-0.30}"
 N_MEMBERS="${N_MEMBERS:-100}"
 EXTRA="${EXTRA:-}"
+
+# Mid-run checkpointing. OFF unless CKPT_EVERY is set, and with it off the python
+# command line below is byte-for-byte what it was before this existed.
+#
+# Expand as ${CKPT_ARGS[@]+"${CKPT_ARGS[@]}"}, NOT "${CKPT_ARGS[@]}". This script
+# runs `set -euo pipefail`, and on bash < 4.4 expanding an EMPTY array under `set
+# -u` is a fatal "unbound variable" -- which is the exact class of bug that killed
+# all three trunks in one second on 2026-09-08 (see aicr_env.sh's note on
+# ${#HF_TOKEN}). Test with `bash -euo pipefail -c`, never `srun bash -c`: that
+# shell has no `set -u` and will not reproduce it.
+CKPT_EVERY="${CKPT_EVERY:-0}"
+CKPT_DIR="${CKPT_DIR:-$S/zoo_ckpt}"
+CKPT_ARGS=()
+if [ "$CKPT_EVERY" -gt 0 ]; then
+    CKPT_ARGS=(--ckpt_every "$CKPT_EVERY" --ckpt_dir "$CKPT_DIR")
+    echo "checkpointing: every $CKPT_EVERY steps -> $CKPT_DIR"
+fi
 # ZOO_ROOT is the PARENT of the arch dir, which is also exactly what
 # EnsembleDataset(zoo_dir=) wants: it reads <zoo_dir>/<arch>/w_<i>.npy. So the
 # same value passes straight to `train_stack.py --zoo_dir` with no second path
@@ -68,5 +85,6 @@ echo "=== zoo trunk: arch=$ARCH beta=$BETA -> $ZOO_DIR ==="
 python -u scripts/train_zoo.py --mode plan  --arch "$ARCH" --beta "$BETA" \
        --n_members "$N_MEMBERS" --zoo_dir "$ZOO_DIR" $EXTRA
 python -u scripts/train_zoo.py --mode trunk --arch "$ARCH" --beta "$BETA" \
-       --n_members "$N_MEMBERS" --zoo_dir "$ZOO_DIR" $EXTRA
+       --n_members "$N_MEMBERS" --zoo_dir "$ZOO_DIR" \
+       ${CKPT_ARGS[@]+"${CKPT_ARGS[@]}"} $EXTRA
 echo "=== done ==="

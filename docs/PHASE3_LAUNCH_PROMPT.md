@@ -288,6 +288,119 @@ REPORT BACK WITH
   5. An analysis of the methods used to decide on β, ready to drop into Overleaf as an appendix to the final publication. 
 ```
 
+Scotts Zoo Launchers
+```
+You are continuing the LLM weight-zoo project on the AICR B200 cluster. Phase 2 Mini is
+COMPLETE at N=100 for both β=0.15 and β=0.30. β is likely to be fixed at 0.15 for future scaled runs. Your job is to focus on using both β=0.15 to launch the GPU heavy medium and large scaled tiers of the zoo. It's worth going in to tweak the WandB logging of these to make sure they are clearly visible. 
+
+READ FIRST, IN THIS ORDER
+  1. docs/PHASE2_RESULTS.md   — what was measured. §2a and §7 change what you may claim.
+  2. docs/PHASE2_HANDOFF.md   — state, artifacts, prerequisites, the 9 traps.
+  3. CLAUDE.md                — the traps, distilled.
+  4. RESEARCH_PLAN.md §6      — contribution 2, which Track A tests.
+  Open reports/phase2_report.html in a browser for the figures.
+
+STATE
+- β = 0.15, decided 2026-09-09. The k=99 spectrum did NOT discriminate between 0.15 and
+  0.30 (effective_rank_ratio 0.0451 vs 0.0452 whole-stack, 0.0727 vs 0.0738 block-only),
+  so §4.3's smallest-passing rule selects 0.15. It saves ~417 GPU-hr on Small + Medium.
+  The one thing given up: β=0.30's probe slope is 2.1× stronger (+0.693 vs +0.328), i.e.
+  more conditioning signal. That trade was made deliberately.
+- Both gates PASS: separation 5/5, min SNR 18.37 (β=0.15) / 10.86 (β=0.30).
+- PCA, codes and a VAE already exist for both arms at k=99:
+  $ARTIFACT_DIR/runs/zoo_b015_mini_k99/ has codes_k99/{codes,family_idxs}.npy, which is
+  ALL train_flow.py reads. Track A needs no new plumbing to start.
+- Env pinned: torch 2.9.1+cu128, transformers 4.57.6, datasets 3.6.0. Secrets in
+  ~/.config/llmzoo/env (mode 600), sourced by slurm/aicr_env.sh. HF_TOKEN now reaches
+  jobs — needed because a singleton mixture opens five HF streams where an anchor opens
+  one.
+
+DO NOT
+- Do not change any dataset id in src/llmzoo/data/mixtures.py. β was calibrated against
+  those exact corpora. RESEARCH_PLAN §6.3 says this in two places and it is still the
+  most likely unforced error.
+- Do not quote effective_rank_ratio without stating k. It divides by k while the
+  effective rank is nearly k-invariant, so it scales as ~1/k: measured 0.045 at k=99 and
+  0.343 at k=10 on the SAME eigenvalues. Prefer the absolute effective_rank.
+  scripts/diag_block_spectrum.py emits the sweep by default.
+- Do not quote a whole-stack spectrum alone. Embeddings are 51.0% of D and carry 86.6%
+  of the variance, so a whole-stack number is substantially an embedding number.
+- Do not re-open β. Read PHASE2_RESULTS §6 first if tempted.
+- Do not scale up the flow (misstep 21). Defaults are (64,128,64) at 500 epochs with
+  --holdout_frac 0.15. Capacity × duration collapses it while the loss improves.
+
+
+===========================================================================
+TRACK B — the larger zoos  (GPU-heavy, unattended)
+===========================================================================
+B0. TINY ~50M, N=100, β=0.15 and β=0.30 are DONE. Just go snoop to verify that they're all there and are clearly labeled/readable. Nothing to train here, you're just snooping. 
+B1. SMALL ~125M, N=100, β=0.15. ~71 GPU-hr. This is §2.1's PRIMARY RESULT and the scale
+    the paper leads with. Nothing to reuse — it needs its own trunk (~3.5 h).
+
+      df -h /work/neu/p2026_0038_neu          # 346 GB free; Small adds ~50 GB
+      python scripts/train_zoo.py --verify_domains && \
+        python scripts/train_zoo.py --verify_mixture     # free, on cpu; do BOTH
+      TRUNK_TIME=06:00:00 BRANCH_TIME=02:30:00 SPEC_TIME=02:00:00 THROTTLE=32 \
+        bash slurm/launch_beta_arm.sh 0.15 100 gpt2_zoo_small
+
+    launch_beta_arm.sh chains trunk → branch array → {gate, spectrum} with afterok,
+    keys ZOO_ROOT and --run_name on (β, arch, N), forwards EXTRA, and excludes the
+    faulty node via EXCLUDE_NODES. Resubmitting is safe: a member whose w_<i>.npy
+    exists exits immediately, and ARRAY= lets you retry a subset.
+
+    BRANCH_TIME MATTERS. Small's branch is ~80 min; the committed default is 60 and
+    would kill every one. Also: an honest --time is the single biggest lever on
+    concurrency — Mini went from 3 to 30 concurrent when --time dropped 60→28 min and
+    --mem 200G→96G. Ask for the real number plus ~30%, not an hour.
+
+B2. MEASURE THE ACHIEVED CONCURRENCY AT SMALL and report it. Do not extrapolate Mini's.
+    Medium needs a 9 h BRANCH_TIME, which is intrinsically far less backfillable, so
+    Small is the only intermediate data point before committing ~375 GPU-hr.
+
+B3. THEN Medium ~250M, N=100, β=0.15. ~375 GPU-hr. TWO HARD PREREQUISITES:
+      (a) mid-run checkpointing in train_span. The trunk is 16.5 h with no resume below
+          whole-member granularity. Checkpoints go to /scratch and are DELETED on
+          member completion — a Medium checkpoint is ~4.3 GB and 100 in /work want
+          426 GB against 346 GB free.
+      (b) ~142 GB of disk. Re-check df first.
+      TRUNK_TIME=20:00:00 BRANCH_TIME=09:00:00 (b200-batch MaxTime is 24 h).
+
+B4. Per scale, report: the §4.3 gate verdict; the absolute effective_rank at k=99 AND
+    the k-sweep; and the block-only spectrum beside the whole-stack one. That last is
+    §4.7's whole point — the embedding share falls 51.0% → 31.6% → 14.8% along the
+    ladder, so a whole-stack-only curve would be plotting the composition of D changing
+    rather than its size.
+
+    scripts/diag_block_spectrum.py does this with no PCA, no GPU and no torch.
+    scripts/diag_zoo_geometry.py is O(N) streaming and safe at N=100.
+
+CLUSTER NOTES THAT COST TIME (handoff §5 has all nine)
+- Every sbatch runs `set -euo pipefail`. A bare ${#VAR} on an unset var is FATAL, and
+  `srun bash -c` will NOT reproduce it — that shell has no set -u. Test with
+  `bash -euo pipefail -c`.
+- rsync excludes match at ANY depth. Anchor repo-root ones with a leading slash, or
+  --exclude='artifacts*/' silently deletes src/llmzoo/artifacts/. The same is true of
+  .gitignore patterns.
+- Node a0016 on rtx-batch throws uncorrectable ECC and Slurm has not drained it.
+  EXCLUDE_NODES defaults to excluding it. Clear that once it is fixed.
+- Keep one zoo on ONE GPU type. bf16 reduction order differs across architectures and
+  lands in the within-anchor spread that gate condition 2 divides by.
+- A gate exiting 1 may be a verdict OR a crash. eval_domains.sbatch now tells you which
+  (`report_written=0` means crash). A crash is NOT an argument for a larger β.
+
+REPORT BACK WITH
+  1. Track A: code_rms_ratio for every generative arm, BEFORE any ΔPPL; then ΔPPL
+     against gauss_codes; then the retrieval baseline; then §6.5's slope on generated
+     models. State plainly whether the flow beat retrieval, because that is the result.
+  2. Track B: per scale, the gate verdict, absolute effective_rank at k=99 with the
+     k-sweep, and block-only beside whole-stack.
+  3. The §4.7 scaling curve: does effective rank grow with D or stay flat? Report both
+     curves. Note the prediction to beat is now concrete — at Mini the leading structure
+     is ≈ dim(Δ⁴) = 4 for embeddings and ≈ 7.2 for blocks. If those hold at Small and
+     Medium, effective rank is set by the conditioning variable rather than by D, which
+     is a sharper claim than §4.4 made.
+  4. Achieved concurrency at Small, and whether Medium is affordable in wall clock (old names, but same idea).
+```
 ---
 
 ## Notes for whoever is driving
