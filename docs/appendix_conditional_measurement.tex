@@ -1,0 +1,455 @@
+% =====================================================================
+%  APPENDIX: Measuring conditional generation in weight space
+%
+%  Drop-in for Overleaf. Paste the body into an existing document, or
+%  compile standalone by uncommenting the preamble below.
+%
+%  Requires: amsmath, booktabs, and hyperref (or url) -- the bibliography
+%  uses \url. The bibliography is self-contained (thebibliography), so no
+%  bibtex/biber run is needed.
+%
+%  Source data: docs/PHASE3A_HANDOFF.md, docs/PHASE2_RESULTS.md.
+%  All numbers measured 2026-09-09 on GPT-2 Mini, N=100.
+% =====================================================================
+
+% ---------------------------------------------------------------------
+% \documentclass[11pt]{article}
+% \usepackage{amsmath,amssymb,booktabs,hyperref}
+% \usepackage[margin=1in]{geometry}
+% \begin{document}
+% ---------------------------------------------------------------------
+
+\section{Measuring conditional generation in weight space}
+\label{app:conditional-measurement}
+
+This appendix defines the instrument used to decide whether a generative model over
+neural network weights is actually \emph{conditioned} on its input, as distinct from
+merely producing plausible weights. The distinction is not academic: on a
+mean-centred ensemble the two are easily confused, and the statistic most naturally
+reached for reports a correctly-conditioned model as a failure.
+
+\subsection{Setup and notation}
+\label{app:setup}
+
+Let $\mathcal{Z} = \{w_1,\dots,w_N\}$ be a zoo of $N$ language models sharing one
+architecture, each flattened to a vector $w_i \in \mathbb{R}^{D}$. Each member is
+associated with a \emph{pretraining data mixture} $\pi_i \in \Delta^{P-1}$, a point on
+the simplex over $P$ text domains. In the runs reported here the architecture is
+GPT-2 \cite{radford2019gpt2} at a reduced scale, $N = 100$, $D = 51{,}475{,}968$
+(embeddings and biases included), and $P = 5$.
+
+All members descend from one initialisation and one shared partially-trained trunk,
+diverging only over the final fraction of training. Members sharing an initialisation
+and a burn-in remain linearly mode connected \cite{frankle2020lmc}, so permutation
+symmetry is broken by construction and no weight-space canonicalisation is applied.
+The zoo is a local manifold around one trunk, not a sample of the global weight
+distribution.
+
+The zoo is \emph{nested}: $20$ members are \emph{anchors}, comprising $5$ one-hot
+mixtures replicated across $4$ branches each, and $80$ are \emph{singletons} drawn
+from $\mathrm{Dirichlet}(\alpha{=}1)$, giving $85$ distinct mixtures. The anchor
+replicates are load-bearing for everything below: they are the only source of
+variation \emph{at fixed $\pi$}.
+
+A dual (Gram) PCA over the $N$ members yields codes $c_i \in \mathbb{R}^{k}$ with
+$k \le N-1$. Codes are then affinely normalised so that the training set has unit
+root-mean-square,
+%
+\begin{equation}
+x_i \;=\; \frac{c_i - \bar{c}}{s},
+\qquad
+s \;=\; \sqrt{\tfrac{1}{k}\textstyle\sum_j \mathrm{Var}_i(c_{ij})},
+\qquad
+\mathrm{RMS}(X) \approx 1 .
+\end{equation}
+%
+The scale $s$ is a single scalar rather than a per-dimension whitening, so PCA's
+variance ordering survives normalisation. All dispersion statistics below are
+computed in this normalised code space.
+
+\subsection{The conditional flow}
+\label{app:flow}
+
+The generator is a conditional rectified flow \cite{liu2022rectified,lipman2022flow}.
+With source $x_0 \sim \mathcal{N}(0, I)$, data point $x_1$, and $t \sim U(0,1)$,
+%
+\begin{equation}
+x_t = (1-t)\,x_0 + t\,x_1,
+\qquad
+u = x_1 - x_0,
+\qquad
+\mathcal{L} = \mathbb{E}\big\|\,v_\theta(x_t, t, \mathbf{c}) - u \,\big\|^2 ,
+\end{equation}
+%
+integrated with explicit Euler. The conditioning representation
+$\mathbf{c} \in \mathbb{R}^{d_c}$ is produced by one of two encoders:
+%
+\begin{align}
+\textbf{discrete:}\quad & \mathbf{c} = \phi\big(E[\,f_i\,]\big),
+  && E \in \mathbb{R}^{F \times d_c} \ \text{an embedding table, } f_i \ \text{a family index},\\
+\textbf{mixture:}\quad  & \mathbf{c} = \phi\big(\mathrm{MLP}(\pi_i)\big),
+  && \mathrm{MLP}: \mathbb{R}^{P} \to \mathbb{R}^{d_c} \ \text{two layers, SiLU},
+\end{align}
+%
+where $\phi$ is a shared projection. The encoder-MLP pattern is
+FiLM's \cite{perez2018film}; diffusion transformers use the same shape for their
+timestep and label embedders \cite{peebles2023dit}. Classifier-free
+guidance \cite{ho2022cfg} is applied to the velocity field,
+$v = v_\varnothing + \gamma\,(v_{\mathbf{c}} - v_\varnothing)$, with a learned null
+token $v_\varnothing$ and conditioning dropout at training time. Because guidance acts
+on the post-projection $\mathbf{c}$ and never on the label, it transfers unchanged from
+the discrete to the continuous encoder.
+
+\paragraph{The discrete encoder is the control, not a legacy path.}
+In a single-architecture zoo every member shares one family index, so the discrete
+encoder is \emph{constant} and the flow is unconditional. The two encoders therefore
+form an exact ablation at fixed codes, fixed network size and fixed training budget.
+
+\subsection{Why the natural metrics are insufficient}
+\label{app:why}
+
+\paragraph{Held-out perplexity cannot police a generative arm.}
+The ensemble is mean-centred and, for a zoo branched from a shared trunk, the mean is
+itself approximately a good model. A generator that collapses toward the mean
+therefore attains a \emph{better} change in perplexity than an honest sample while
+generating nothing. We previously measured a collapsed flow beating a Gaussian null
+by $43\times$ on $\Delta$PPL while emitting at $0.25\times$ the correct dispersion. A
+Gaussian null cannot detect this, because a collapsed generator beats it by
+construction.
+
+\paragraph{Marginal dispersion detects collapse but not conditioning.}
+The natural repair is to measure spread directly,
+%
+\begin{equation}
+r_{\mathrm{pooled}} \;=\;
+\frac{\mathrm{RMS}\big(\,\text{generated codes}\,\big)}{\mathrm{RMS}\big(\,\text{real codes}\,\big)} ,
+\label{eq:pooled}
+\end{equation}
+%
+which reads $1$ for a faithful generator and falls toward $0$ under collapse. It is
+necessary and it is not sufficient: \textbf{a generator that ignores its conditioning
+entirely still emits the correct total spread and scores a perfect $1.0$.}
+
+\paragraph{Worse, \eqref{eq:pooled} inverts under conditioning.}
+Samples drawn at a \emph{fixed} $\pi$ carry the conditional spread, whereas the
+denominator of \eqref{eq:pooled} carries the pooled spread, which also contains all
+between-mixture variation. Writing $\rho = \mathrm{RMS}_{\text{within}} /
+\mathrm{RMS}_{\text{pooled}}$, a \emph{perfectly} conditioned generator evaluated this
+way reads $r_{\mathrm{pooled}} = \rho$. Measured here $\rho \approx 0.33$ --- which is
+numerically indistinguishable from the $0.25$ recorded for genuine collapse. Reported
+naively, a correct model and a catastrophic one are the same number.
+
+\subsection{A conditional dispersion statistic}
+\label{app:atpi}
+
+The anchor replicates supply the missing reference. The four branches of an anchor
+were trained on an \emph{identical} mixture and differ only through data order and
+initialisation of the branch, so their spread is the irreducible noise of ``train a
+model on this mixture'' --- precisely the width a correct conditional distribution
+should have. Let $X_a$ be the codes of one anchor group and $S$ be $n$ samples drawn
+from the generator at that anchor's mixture. Define
+%
+\begin{equation}
+\mathrm{RMS}_{\text{within}} = \mathrm{RMS}\big(X_a - \overline{X_a}\big),
+\qquad
+a_\pi \;=\; \frac{\mathrm{RMS}\big(S - \overline{S}\big)}{\mathrm{RMS}_{\text{within}}} .
+\label{eq:atpi}
+\end{equation}
+%
+Three landmarks make $a_\pi$ readable:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+$a_\pi \approx 0$   & point mass per mixture --- memorisation or collapse \\
+$a_\pi \approx 1$   & correct conditional width \\
+$a_\pi \approx 1/\rho$ & the full marginal spread --- \textbf{the conditioning was ignored} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Recovery: a rank-invariant summary}
+\label{app:recovery}
+
+$a_\pi$ is awkward to compare across ranks, because truncating the code space
+discards within-mixture noise and so shrinks its denominator: $\rho$ falls from
+$0.320$ at $k{=}99$ to $0.022$ at $k{=}10$, and a raw $a_\pi$ of $23$ at low rank
+reflects that shrinkage rather than a defective model. The law of total variance
+gives a scale-free alternative. Decomposing
+%
+\begin{equation}
+\mathrm{Var}_{\text{total}}
+= \underbrace{\mathbb{E}_\pi\big[\mathrm{Var}(x \mid \pi)\big]}_{\text{within}}
++ \underbrace{\mathrm{Var}_\pi\big[\mathbb{E}(x \mid \pi)\big]}_{\text{between}} ,
+\end{equation}
+%
+the fraction of code variance attributable to the mixture is
+$1 - \mathbb{E}[\mathrm{Var}(x\mid\pi)]/\mathrm{Var}_{\text{total}}$. Estimating the
+conditional variance from the generator and the total from the data,
+%
+\begin{align}
+\text{explained}_{\text{flow}} &= 1 - \big(a_\pi \cdot \rho\big)^2, \label{eq:flowvar}\\
+\text{ceiling}_{\text{data}}   &= 1 - \rho^2, \label{eq:ceiling}\\
+\textbf{recovery} &= \text{explained}_{\text{flow}} \,/\, \text{ceiling}_{\text{data}} .
+\label{eq:recovery}
+\end{align}
+%
+Recovery is $0$ when the mixture is ignored and $1$ when the generator reproduces all
+of the conditional structure the data contains at that rank. Equation
+\eqref{eq:ceiling} must be evaluated \emph{per rank}: truncation mechanically raises
+the share the mixture could explain, and comparing a low-rank model against a
+high-rank ceiling would overstate it.
+
+\paragraph{Why recovery $\approx 0$ is a conclusion, not a coincidence.}
+One might object that matching widths does not preclude the conditional \emph{mean}
+moving with $\pi$. It does. If $\mathbb{E}(x \mid \pi)$ varied appreciably while
+$\mathrm{Var}(x \mid \pi)$ remained at the marginal variance, the total variance would
+strictly exceed the marginal --- a contradiction. Measuring the two equal forces the
+between-mixture term to vanish.
+
+\subsection{A pairing control}
+\label{app:pairing}
+
+A generative null result and a corrupted data join are indistinguishable after the
+fact: if codes are paired with the wrong mixtures, the model trains on shuffled
+conditioning and every downstream conditioning statistic is flat for a reason that
+has nothing to do with modelling. We therefore report
+%
+\begin{equation}
+\tau \;=\; \mathrm{corr}_{i<j}\Big(\; \|\pi_i - \pi_j\|_1 \;,\; \|x_i - x_j\|_2 \;\Big),
+\end{equation}
+%
+computed over all member pairs. No generative model is involved: $\tau$ is a property
+of the data, it is positive when mixture distance predicts weight-space distance, and
+it is $\approx 0$ under a shuffled join. Measured $\tau \in [{+}0.63, {+}0.69]$ across
+all reported cells, against $O(10^{-2})$ for a permuted control.
+
+\subsection{Results}
+\label{app:results}
+
+\paragraph{The conditioning axis is inert at the default training budget.}
+Across $16$ cells spanning two divergence settings $\beta \in \{0.15, 0.30\}$, two
+basis constructions, two ranks and both encoders, $r_{\mathrm{pooled}}$ lies in
+$[0.85, 1.10]$ --- nothing is collapsed --- and $\tau \in [{+}0.63, {+}0.69]$. Yet
+recovery is $\approx 2\%$ at $k = N{-}1$ and $\approx 20\%$ at $k = N/2$. The marginal
+statistic \eqref{eq:pooled} reads healthy in \emph{every} one of these cells.
+
+\paragraph{The cause is optimisation, not expressive capacity.}
+Table~\ref{tab:diagnosis} separates the candidates. The dataset has $85$ rows and the
+batch size is $64$, so the default $500$ epochs is roughly $10^3$ optimiser steps.
+
+\begin{table}[t]
+\centering
+\caption{Diagnosis of conditioning failure. Twelve cells at $\beta = 0.15$;
+recovery is \eqref{eq:recovery}. $a_\pi$ below $1$ indicates a conditional
+distribution \emph{tighter} than real within-mixture variation.}
+\label{tab:diagnosis}
+\small
+\begin{tabular}{lrrlrrr}
+\toprule
+Cell & $k$ & Epochs & Hidden & $a_\pi$ & $r_{\mathrm{pooled}}$ & Recovery \\
+\midrule
+\multicolumn{7}{l}{\emph{Rank, at the default budget}}\\
+& 99 & 500 & 64,128,64 & 3.100 & 1.061 & \phantom{0}1.8\% \\
+& 50 & 500 & 64,128,64 & 2.654 & 0.948 & 27.6\% \\
+& 25 & 500 & 64,128,64 & 22.131 & 0.831 & 53.0\% \\
+& 10 & 500 & 64,128,64 & 23.201 & 0.823 & 74.0\% \\
+\midrule
+\multicolumn{7}{l}{\emph{Training duration, at $k=50$}}\\
+& 50 & 2000 & 64,128,64 & 2.362 & 1.115 & 45.2\% \\
+& 50 & 8000 & 64,128,64 & 1.348 & 1.159 & \textbf{90.2\%} \\
+& 50 & 20000 & 64,128,64 & \textbf{0.955} & 1.081 & 101.1\% \\
+\midrule
+\multicolumn{7}{l}{\emph{Capacity}}\\
+& 50 & 500 & 256,512,256 & 1.751 & 1.027 & 75.3\% \\
+& 50 & 8000 & 256,512,256 & 1.243 & 1.144 & \textbf{93.5\%} \\
+& 99 & 8000 & 64,128,64 & 2.804 & 1.336 & 21.7\% \\
+& 99 & 8000 & 256,512,256 & 1.796 & 1.136 & \textbf{74.6\%} \\
+\midrule
+\multicolumn{7}{l}{\emph{Conditioning dropout}}\\
+& 50 & 500 & 64,128,64 & 2.550 & 0.930 & 34.1\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three observations follow.
+
+\begin{enumerate}
+\item \textbf{The conditioning encoder was never the constraint.} It is a two-layer
+MLP on a $5$-dimensional input, and the structure to be represented is at most
+$\dim(\Delta^{4}) = 4$-dimensional. Holding it fixed and increasing the training
+budget alone moves recovery from $27.6\%$ to $90.2\%$.
+
+\item \textbf{Rank is a convergence-rate axis, not a structural one.} At $k = N-1$
+recovery appears hopeless at $1.8\%$, but reaches $74.6\%$ with additional capacity
+and duration. Lower ranks converge faster because truncation removes noise
+directions; they do not unlock structure that $k = N-1$ cannot reach.
+
+\item \textbf{Over-fitting is present, but it is invisible to the marginal
+statistic.} At $20{,}000$ epochs $a_\pi$ falls to $0.955$: the generator's conditional
+distribution is now \emph{narrower} than genuine within-mixture variation, the
+signature of memorising the training points at each mixture. Simultaneously
+$r_{\mathrm{pooled}} = 1.081$, entirely healthy. On a flat, unstructured ensemble the
+same over-fitting instead collapses the \emph{marginal}, where \eqref{eq:pooled}
+detects it readily. The failure mode does not disappear with structured data; it
+migrates to a statistic that is not routinely reported.
+\end{enumerate}
+
+\subsection{The retrieval baseline}
+\label{app:retrieval}
+
+Dispersion statistics constrain the \emph{shape} of the generated distribution and say
+nothing about whether generation beats lookup. For a held-out mixture $\pi$ we compare
+the generated model against the trained model whose mixture is nearest to $\pi$ in
+$L^1$ on the simplex. Models are scored by the mixture-weighted mean log perplexity,
+%
+\begin{equation}
+L(m, \pi) \;=\; \sum_{d=1}^{P} \pi_d \, \log \mathrm{ppl}_d(m) ,
+\end{equation}
+%
+which weights each domain by the mixture the model was asked to embody; the logarithm
+makes the quantity additive, since perplexity composes multiplicatively. The anchor
+replicates again supply the resolution: $\sigma$, the standard deviation of $L$ across
+an anchor's four branches, is the noise floor of the instrument, measured
+$\sigma = 0.0076$ nats at $\beta = 0.15$.
+
+Define the \emph{headroom} $H = L(\text{retrieval}, \pi) - L(\text{ceiling}, \pi)$,
+where the ceiling is the model actually trained at $\pi$. $H$ is the margin any
+generator has available. We pre-register the rule that a recovery fraction
+$(L_{\text{retr}} - L_{\text{gen}})/H$ is reported only where $H > 3\sigma$;
+otherwise the cell is declared unresolvable and only the raw difference with its error
+bar is given. Without this guard the ratio diverges with arbitrary sign on precisely
+the cells that carry no information.
+
+\begin{table}[t]
+\centering
+\caption{Retrieval baseline at $\beta = 0.15$, $\sigma = 0.0076$ nats. On every
+interior held-out mixture the nearest trained neighbour matches or beats the model
+trained at that mixture; only the vertex leaves measurable headroom.}
+\label{tab:retrieval}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Held-out mixture & $L^1$ to nearest & Ceiling & Retrieval & $H$ & $H/\sigma$ \\
+\midrule
+interior (a) & 0.261 & 3.8067 & 3.8008 & $-0.0059$ & $-0.8$ \\
+interior (b) & 0.173 & 3.8280 & 3.8376 & $+0.0095$ & $+1.2$ \\
+interior (c) & 0.239 & 3.9175 & 3.9157 & $-0.0018$ & $-0.2$ \\
+interior (d) & 0.344 & 3.7454 & 3.7245 & $-0.0209$ & $-2.7$ \\
+\textbf{vertex} & 0.568 & 3.8556 & 4.0566 & $\mathbf{+0.2010}$ & $\mathbf{+26.4}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:retrieval} reports a design consequence worth stating explicitly. The
+interior held-out mixtures are, by construction, those nearest the barycentre of the
+simplex --- the densest region of the sample. Retrieval is consequently at or better
+than the ceiling in three of four cells, and \textbf{no generative claim is available
+in them at all}. Only the held-out vertex, an extrapolation target, leaves headroom.
+A generative result quoted on interior interpolation alone would be unfalsifiable.
+
+\subsection{Limitations}
+\label{app:limitations}
+
+\begin{enumerate}
+\item \textbf{No dispersion statistic can establish generalisation.} A value
+$a_\pi \approx 1$ is equally consistent with having learned $p(x \mid \pi)$ and with
+having memorised the four anchor members at that mixture: a mixture of four memorised
+point masses has exactly the correct conditional spread. Separating these requires a
+held-out mixture evaluated against the retrieval baseline of
+\S\ref{app:retrieval}. This is the same concern that motivates nearest-neighbour
+retrieval baselines in the diffusion memorisation
+literature \cite{carlini2023extracting,somepalli2023replication}.
+
+\item \textbf{The within-mixture reference is a four-sample estimate}, drawn from
+anchor groups that sit at simplex vertices and are therefore the most extreme
+mixtures present. The rank- and duration-dependence reported in
+Table~\ref{tab:diagnosis} is consistent across many independent cells and is robust;
+the absolute scale of $\rho$ should not be quoted to three significant figures. The
+$k = 25$ and $k = 10$ rows in particular have denominators small enough
+($\rho = 0.031$, $0.022$) to be noise-dominated, and are reported as directional only.
+
+\item \textbf{Conditioning on a near-unique key.} With $85$ distinct mixtures over
+$100$ members, $80$ of them observed exactly once, there is little or no replication
+at most conditioning values. This is the regime in which continuous-conditional
+generative models are known to be difficult to estimate \cite{ding2021ccgan}, and it
+is a property of the zoo's construction rather than of the model.
+
+\item \textbf{All statistics in \S\ref{app:atpi}--\S\ref{app:pairing} are computed in
+code space.} They constrain the geometry of the generated distribution and do not
+establish that a generated model is functionally good. Functional evaluation is
+reported separately.
+\end{enumerate}
+
+% =====================================================================
+\begin{thebibliography}{99}
+
+\bibitem{liu2022rectified}
+X.~Liu, C.~Gong, and Q.~Liu.
+\newblock Flow Straight and Fast: Learning to Generate and Transfer Data with
+  Rectified Flow.
+\newblock \emph{arXiv:2209.03003}, 2022.
+  \url{https://arxiv.org/abs/2209.03003}
+
+\bibitem{lipman2022flow}
+Y.~Lipman, R.~T.~Q. Chen, H.~Ben-Hamu, M.~Nickel, and M.~Le.
+\newblock Flow Matching for Generative Modeling.
+\newblock \emph{arXiv:2210.02747}, 2022.
+  \url{https://arxiv.org/abs/2210.02747}
+
+\bibitem{ho2022cfg}
+J.~Ho and T.~Salimans.
+\newblock Classifier-Free Diffusion Guidance.
+\newblock \emph{arXiv:2207.12598}, 2022.
+  \url{https://arxiv.org/abs/2207.12598}
+
+\bibitem{perez2018film}
+E.~Perez, F.~Strub, H.~de~Vries, V.~Dumoulin, and A.~Courville.
+\newblock FiLM: Visual Reasoning with a General Conditioning Layer.
+\newblock \emph{arXiv:1709.07871}, 2017.
+  \url{https://arxiv.org/abs/1709.07871}
+
+\bibitem{peebles2023dit}
+W.~Peebles and S.~Xie.
+\newblock Scalable Diffusion Models with Transformers.
+\newblock \emph{arXiv:2212.09748}, 2022.
+  \url{https://arxiv.org/abs/2212.09748}
+
+\bibitem{ding2021ccgan}
+X.~Ding, Y.~Wang, Z.~Xu, W.~J. Welch, and Z.~J. Wang.
+\newblock CcGAN: Continuous Conditional Generative Adversarial Networks for Image
+  Generation.
+\newblock \emph{ICLR}, 2021. \emph{arXiv:2011.07466}.
+  \url{https://arxiv.org/abs/2011.07466}
+
+\bibitem{carlini2023extracting}
+N.~Carlini, J.~Hayes, M.~Nasr, M.~Jagielski, V.~Sehwag, F.~Tram\`er, B.~Balle,
+  D.~Ippolito, and E.~Wallace.
+\newblock Extracting Training Data from Diffusion Models.
+\newblock \emph{arXiv:2301.13188}, 2023.
+  \url{https://arxiv.org/abs/2301.13188}
+
+\bibitem{somepalli2023replication}
+G.~Somepalli, V.~Singla, M.~Goldblum, J.~Geiping, and T.~Goldstein.
+\newblock Diffusion Art or Digital Forgery? Investigating Data Replication in
+  Diffusion Models.
+\newblock \emph{arXiv:2212.03860}, 2022.
+  \url{https://arxiv.org/abs/2212.03860}
+
+\bibitem{frankle2020lmc}
+J.~Frankle, G.~K. Dziugaite, D.~M. Roy, and M.~Carbin.
+\newblock Linear Mode Connectivity and the Lottery Ticket Hypothesis.
+\newblock \emph{arXiv:1912.05671}, 2019.
+  \url{https://arxiv.org/abs/1912.05671}
+
+\bibitem{radford2019gpt2}
+A.~Radford, J.~Wu, R.~Child, D.~Luan, D.~Amodei, and I.~Sutskever.
+\newblock Language Models are Unsupervised Multitask Learners.
+\newblock OpenAI technical report, 2019.
+  \url{https://github.com/openai/gpt-2}
+
+\end{thebibliography}
+
+% ---------------------------------------------------------------------
+% \end{document}
+% ---------------------------------------------------------------------
